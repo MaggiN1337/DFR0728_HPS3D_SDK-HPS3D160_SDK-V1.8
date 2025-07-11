@@ -1,17 +1,8 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -I./src -I./lib
+CFLAGS = -I./src
 LDFLAGS = -L./lib -lHPS3D
 SRC = src/main.c
-OBJ = $(SRC:.c=.o)
-TARGET = hps3d-distance-cli
+OUT = hps3d-distance-cli
 
-all: $(TARGET)
-
-$(TARGET): $(OBJ)
-	$(CC) -o $@ $^
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-clean:
-	rm -f $(OBJ) $(TARGET)
+all:
+	$(CC) $(CFLAGS) $(SRC) -o $(OUT) $(LDFLAGS)
