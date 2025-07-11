@@ -73,7 +73,7 @@ void query_distance(int pixel_x, int pixel_y) {
     HPS3D_StatusTypeDef ret;
 
     ret = HPS3D_SingleCapture(g_handle, &event_type, &g_measureData);
-    printf("SingleCapture ret=%d, event_type=%d\n", ret, event_type);
+    //Debug: printf("SingleCapture ret=%d, event_type=%d\n", ret, event_type);
 
     if (ret != HPS3D_RET_OK) {
         printf("SingleCapture failed, Err:%d\n", ret);
@@ -83,8 +83,7 @@ void query_distance(int pixel_x, int pixel_y) {
     if (event_type == HPS3D_FULL_DEPTH_EVEN) {
         int width = g_measureData.full_depth_data.point_cloud_data.width;
         int height = g_measureData.full_depth_data.point_cloud_data.height;
-        //debug
-        printf("width=%d, height=%d\n", width, height);
+        //debug printf("width=%d, height=%d\n", width, height);
         if (pixel_x < 0 || pixel_x >= width || pixel_y < 0 || pixel_y >= height) {
             printf("Pixel coordinates out of range! (width: %d, height: %d)\n", width, height);
             return;
@@ -105,8 +104,7 @@ int main(int argc, char *argv[]) {
     int pixel_x = atoi(argv[1]);
     int pixel_y = atoi(argv[2]);
 
-    //debug
-    printf("pixel_x=%d, pixel_y=%d\n", pixel_x, pixel_y);
+    //debug printf("pixel_x=%d, pixel_y=%d\n", pixel_x, pixel_y);
 
     HPS3D_StatusTypeDef ret = HPS3D_RET_OK;
 
@@ -133,7 +131,5 @@ int main(int argc, char *argv[]) {
 
     HPS3D_StopCapture(g_handle);
     HPS3D_CloseDevice(g_handle);
-    //HPS3D_MeasureDataFree(&g_measureData);
-    printf("Device disconnected!\n\n");
     return 0;
 }
