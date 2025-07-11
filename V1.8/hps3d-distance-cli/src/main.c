@@ -8,6 +8,7 @@ static int g_handle = -1;
 static HPS3D_MeasureData_t g_measureData;
 
 void signal_handler(int sig) {
+    (void)sig; // suppress unused parameter warning
     HPS3D_StopCapture(g_handle);
     HPS3D_CloseDevice(g_handle);
     exit(0);
@@ -24,8 +25,8 @@ void query_distance(int pixel_x, int pixel_y) {
     }
 
     if (event_type == HPS3D_FULL_DEPTH_EVEN) {
-        int width = g_measureData.full_depth_data.width;
-        int height = g_measureData.full_depth_data.height;
+        int width = g_measureData.full_depth_data.point_cloud_data.width;
+        int height = g_measureData.full_depth_data.point_cloud_data.height;
         if (pixel_x < 0 || pixel_x >= width || pixel_y < 0 || pixel_y >= height) {
             printf("Pixel coordinates out of range! (width: %d, height: %d)\n", width, height);
             return;
