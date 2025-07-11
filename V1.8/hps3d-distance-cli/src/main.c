@@ -113,7 +113,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
 
     // Initialisiere Messdatenstruktur
-    //HPS3D_MeasureDataInit(&g_measureData);
+    HPS3D_MeasureDataInit(&g_measureData);
 
     ret = HPS3D_USBConnectDevice((char *)"/dev/ttyACM0", &g_handle);
     if (ret != HPS3D_RET_OK) {
