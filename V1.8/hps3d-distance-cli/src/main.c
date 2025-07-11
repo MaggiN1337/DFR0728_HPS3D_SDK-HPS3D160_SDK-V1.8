@@ -22,7 +22,6 @@ static void EventCallBackFunc(int handle, int eventType, uint8_t *data,int dataL
         case HPS3D_SIMPLE_DEPTH_EVEN:
             printf("handle:%d!\n", handle);
             HPS3D_ConvertToMeasureData(data,&g_measureData, (HPS3D_EventType_t)eventType);
-            PrintResultData((HPS3D_EventType_t)eventType, g_measureData);
             break;
         case HPS3D_SYS_EXCEPTION_EVEN: /* System exception notification event */
             printf("SYS ERR :%s\n", data);
