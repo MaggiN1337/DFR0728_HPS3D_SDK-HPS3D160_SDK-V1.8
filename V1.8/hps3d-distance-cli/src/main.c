@@ -48,6 +48,10 @@ int main(int argc, char *argv[]) {
     int pixel_y = atoi(argv[2]);
 
     signal(SIGINT, signal_handler);
+
+    // Initialisiere Messdatenstruktur, falls nötig
+    HPS3D_MeasureDataInit(&g_measureData);
+
     HPS3D_StatusTypeDef ret = HPS3D_USBConnectDevice((char *)"/dev/ttyACM0", &g_handle);
     if (ret != HPS3D_RET_OK) {
         printf("Device connection failed, Err:%d\n", ret);
