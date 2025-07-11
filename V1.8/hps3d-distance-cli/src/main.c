@@ -65,8 +65,6 @@ int main(int argc, char *argv[]) {
         printf("Usage: %s <pixel_x> <pixel_y>\n", argv[0]);
         return 1;
     }
-    //debug
-    printf("width=%d, height=%d\n", width, height);
 
     int pixel_x = atoi(argv[1]);
     int pixel_y = atoi(argv[2]);
