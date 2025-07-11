@@ -2,7 +2,28 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <string.h>
 #include "HPS3DUser_IF.h"
+// Function prototypes for missing functions
+void PrintResultData(HPS3D_EventType_t eventType, HPS3D_MeasureData_t measureData);
+void HPS3D_MeasureDataInit(HPS3D_MeasureData_t *measureData);
+void HPS3D_MeasureDataFree(HPS3D_MeasureData_t *measureData);
+
+// Stub implementations for missing functions (replace with actual implementations if available)
+void PrintResultData(HPS3D_EventType_t eventType, HPS3D_MeasureData_t measureData) {
+    // Stub: Do nothing or print minimal info
+}
+void HPS3D_MeasureDataInit(HPS3D_MeasureData_t *measureData) {
+    // Stub: Zero out the struct
+    if (measureData) {
+        memset(measureData, 0, sizeof(HPS3D_MeasureData_t));
+    }
+}
+void HPS3D_MeasureDataFree(HPS3D_MeasureData_t *measureData) {
+    // Stub: Do nothing
+}
+void HPS3D_MeasureDataFree(HPS3D_MeasureData_t *measureData);
 
 static int g_handle = -1;
 static HPS3D_MeasureData_t g_measureData;
@@ -114,19 +135,18 @@ int main(int argc, char *argv[]) {
     // Initialisiere Messdatenstruktur
     HPS3D_MeasureDataInit(&g_measureData);
 
-    HPS3D_StatusTypeDef ret = HPS3D_USBConnectDevice((char *)"/dev/ttyACM0", &g_handle);
+    ret = HPS3D_USBConnectDevice((char *)"/dev/ttyACM0", &g_handle);
     if (ret != HPS3D_RET_OK) {
         printf("Device connection failed, Err:%d\n", ret);
         return -1;
     }
 
-		// Register event callback function to receive continuous return packets and handle exceptions;
-    ret= HPS3D_RegisterEventCallback(EventCallBackFunc, NULL);
+    ret = HPS3D_RegisterEventCallback(EventCallBackFunc, NULL);
     if (ret != HPS3D_RET_OK)
     {
         printf("Failed to register callback function, Err:%d\n", ret);
-        break;
-
+        HPS3D_CloseDevice(g_handle);
+        return -1;
     }
 
     query_distance(pixel_x, pixel_y);
