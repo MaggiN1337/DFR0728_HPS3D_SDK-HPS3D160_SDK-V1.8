@@ -29,11 +29,12 @@
 #define MAX_POINTS 4
 #define AREA_SIZE 5        // 5x5 Pixel Messbereich
 #define AREA_OFFSET 2      // (5-1)/2 für zentrierten Bereich
-#define MEASURE_INTERVAL_MS 1000  // 10 Hz Messrate
-#define OUTPUT_INTERVAL_MS 2000  // 1 Hz Output für NodeRed
+#define DEFAULT_MIN_VALID_PIXELS 6  // Standard: 25% der Pixel (6 von 25)
+#define MEASURE_INTERVAL_MS 500  // 50 Hz Messrate
+#define OUTPUT_INTERVAL_MS 1000  // 1 Hz Output für NodeRed
 #define CONFIG_FILE "/etc/hps3d/points.conf"
 #define PID_FILE "/var/run/hps3d_service.pid"
-#define DEBUG_FILE "hps3d_debug.log"  // Debug-Ausgaben in diese Datei
+#define DEFAULT_DEBUG_FILE "debug_hps3d.log"  // Standard Debug-Datei
 #define USB_PORT "/dev/ttyACM0"  // Standard USB Port für HPS3D-160
 
 // Globale Variablen
@@ -43,10 +44,12 @@ static int g_handle = -1;
 static HPS3D_MeasureData_t g_measureData;
 static bool reconnect_needed = false;
 static FILE* debug_file = NULL;  // File handle für Debug-Ausgaben
+static int debug_enabled = 0;    // Debug-Status aus Konfiguration
+static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;  // Minimale Anzahl gültiger Pixel
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
-    if (debug_file) {
+    if (debug_enabled && debug_file) {
         va_list args;
         va_start(args, format);
         vfprintf(debug_file, format, args);
@@ -106,14 +109,40 @@ int load_config() {
     
     char line[256];
     int point_idx = 0;
+    char debug_file_path[256] = DEFAULT_DEBUG_FILE;
     
-    while (fgets(line, sizeof(line), fp) && point_idx < MAX_POINTS) {
+    while (fgets(line, sizeof(line), fp)) {
+        // Kommentare und leere Zeilen überspringen
         if (line[0] == '#' || line[0] == '\n') continue;
         
+        // Debug-Einstellungen verarbeiten
+        if (strncmp(line, "debug=", 6) == 0) {
+            debug_enabled = atoi(line + 6);
+            continue;
+        }
+        
+        if (strncmp(line, "debug_file=", 11) == 0) {
+            char* path = line + 11;
+            // Newline am Ende entfernen
+            char* nl = strchr(path, '\n');
+            if (nl) *nl = '\0';
+            // Wenn ein Pfad angegeben ist, diesen verwenden
+            if (strlen(path) > 0) {
+                strncpy(debug_file_path, path, sizeof(debug_file_path)-1);
+            }
+            continue;
+        }
+
+        // Minimale gültige Pixel-Einstellung verarbeiten
+        if (strncmp(line, "min_valid_pixels=", 17) == 0) {
+            min_valid_pixels = atoi(line + 17);
+            continue;
+        }
+        
+        // Messpunkte verarbeiten
         int x, y;
         char name[32];
-        if (sscanf(line, "%d,%d,%s", &x, &y, name) == 3) {
-            // Prüfe ob der 5x5 Bereich innerhalb des Sensors liegt
+        if (point_idx < MAX_POINTS && sscanf(line, "%d,%d,%s", &x, &y, name) == 3) {
             if (x >= AREA_OFFSET && x < (160 - AREA_OFFSET) && 
                 y >= AREA_OFFSET && y < (60 - AREA_OFFSET)) {
                 points[point_idx].x = x;
@@ -127,7 +156,19 @@ int load_config() {
     }
     
     fclose(fp);
-    printf("Konfiguration geladen: %d Punkte\n", point_idx);
+    
+    // Debug-Datei öffnen wenn aktiviert
+    if (debug_enabled) {
+        debug_file = fopen(debug_file_path, "w");
+        if (!debug_file) {
+            printf("WARNUNG: Debug-Datei %s konnte nicht geöffnet werden\n", debug_file_path);
+        } else {
+            printf("Debug-Ausgaben werden in %s geschrieben\n", debug_file_path);
+        }
+    }
+    
+    printf("Konfiguration geladen: %d Punkte, Debug %s, min_valid_pixels %d\n", 
+           point_idx, debug_enabled ? "aktiviert" : "deaktiviert", min_valid_pixels);
     return point_idx;
 }
 
@@ -252,18 +293,23 @@ int measure_points() {
             }
             debug_print("----------------------------------------\n");
             
-            // Messung ist gültig wenn mindestens 25% der Pixel gültig sind (weniger streng)
-            int required_valid_pixels = (AREA_SIZE * AREA_SIZE) / 4;
-            if (valid_count >= required_valid_pixels) {
+            // Messung ist gültig wenn mindestens die konfigurierte Anzahl Pixel gültig sind
+            if (valid_count >= min_valid_pixels) {
                 points[i].distance = sum_distance / valid_count;
                 points[i].min_distance = min_distance;
                 points[i].max_distance = max_distance;
                 points[i].valid_pixels = valid_count;
                 points[i].valid = 1;
                 points[i].timestamp = time(NULL);
+                
+                debug_print("Messung gültig: %d/%d Pixel (min: %d)\n", 
+                          valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
             } else {
                 points[i].valid = 0;
                 points[i].valid_pixels = valid_count;
+                
+                debug_print("Messung ungültig: %d/%d Pixel (min: %d)\n", 
+                          valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
             }
         }
     }
@@ -365,12 +411,6 @@ void cleanup() {
 int main(int argc, char *argv[]) {
     printf("HPS3D-160 LIDAR Service gestartet\n");
     
-    // Debug-Datei öffnen
-    debug_file = fopen(DEBUG_FILE, "w");
-    if (!debug_file) {
-        printf("WARNUNG: Debug-Datei konnte nicht geöffnet werden\n");
-    }
-    
     // Signal Handler
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -412,11 +452,5 @@ int main(int argc, char *argv[]) {
     pthread_join(output_tid, NULL);
     
     cleanup();
-    
-    // Debug-Datei schließen
-    if (debug_file) {
-        fclose(debug_file);
-    }
-    
     return 0;
 }
