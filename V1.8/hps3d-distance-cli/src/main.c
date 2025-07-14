@@ -49,7 +49,7 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define AREA_SIZE 5        // 5x5 Pixel Messbereich
 #define AREA_OFFSET 2      // (5-1)/2 für zentrierten Bereich
 #define DEFAULT_MIN_VALID_PIXELS 6  // Standard: 25% der Pixel (6 von 25)
-#define MEASURE_INTERVAL_MS 1000  // Reduziert auf 1 Hz für stabilere Messungen
+#define MEASURE_INTERVAL_MS 1500  // 1.5 Hz für stabilere Messungen mit mehr Zeit zwischen Messungen
 #define OUTPUT_INTERVAL_MS 2000  // Output alle 2 Sekunden
 #define CONFIG_FILE "/etc/hps3d/points.conf"
 #define PID_FILE "/var/run/hps3d_service.pid"
@@ -138,12 +138,16 @@ void debug_print(const char* format, ...) {
     
     // Beim ersten Aufruf Debug-File öffnen
     if (!debug_file) {
-        debug_file = fopen(DEFAULT_DEBUG_FILE, "w");
+        // Verzeichnis erstellen falls nicht vorhanden
+        mkdir("/var/log/hps3d", 0755);
+        
+        debug_file = fopen(DEFAULT_DEBUG_FILE, "a");  // Append statt Write
         if (!debug_file) {
-            fprintf(stderr, "FEHLER: Debug-Datei konnte nicht geöffnet werden\n");
+            fprintf(stderr, "FEHLER: Debug-Datei %s konnte nicht geöffnet werden\n", DEFAULT_DEBUG_FILE);
             pthread_mutex_unlock(&debug_mutex);
             return;
         }
+        debug_print("Debug-Logging initialisiert\n");
     }
 
     va_list args;
@@ -251,11 +255,102 @@ int measure_points() {
         return -1;
     }
 
-    HPS3D_EventType_t event_type;
-    HPS3D_StatusTypeDef ret = HPS3D_SingleCapture(g_handle, &event_type, &g_measureData);
-    
-    if (ret != HPS3D_RET_OK) {
-        debug_print("WARNUNG: Messung fehlgeschlagen (Code: %d)\n", ret);
+    // Add delay before measurement to ensure sensor is ready
+    usleep(50000);  // 50ms pause before measurement
+
+    // Try measurement up to 3 times
+    for (int retry = 0; retry < 3; retry++) {
+        HPS3D_EventType_t event_type;
+        HPS3D_StatusTypeDef ret = HPS3D_SingleCapture(g_handle, &event_type, &g_measureData);
+        
+        if (ret == HPS3D_RET_OK) {
+            pthread_mutex_lock(&data_mutex);
+            
+            // Alle 4 Punkte messen
+            if (event_type == HPS3D_FULL_DEPTH_EVEN) {
+                for (int i = 0; i < MAX_POINTS; i++) {
+                    int center_x = points[i].x;
+                    int center_y = points[i].y;
+                    float sum_distance = 0;
+                    int valid_count = 0;
+                    float min_distance = 65000;
+                    float max_distance = 0;
+                    
+                    // Debug: Array für Rohdaten
+                    uint16_t raw_values[AREA_SIZE * AREA_SIZE];
+                    int raw_idx = 0;
+                    
+                    // 5x5 Bereich um den Punkt messen
+                    for (int dy = -AREA_OFFSET; dy <= AREA_OFFSET; dy++) {
+                        for (int dx = -AREA_OFFSET; dx <= AREA_OFFSET; dx++) {
+                            int x = center_x + dx;
+                            int y = center_y + dy;
+                            int pixel_index = y * 160 + x;
+                            
+                            uint16_t distance_raw = g_measureData.full_depth_data.distance[pixel_index];
+                            raw_values[raw_idx++] = distance_raw;
+                            
+                            // Erweiterte Gültigkeitsprüfung
+                            if (distance_raw > 0 && distance_raw < 65000 && 
+                                distance_raw != HPS3D_LOW_AMPLITUDE && 
+                                distance_raw != HPS3D_SATURATION && 
+                                distance_raw != HPS3D_ADC_OVERFLOW && 
+                                distance_raw != HPS3D_INVALID_DATA) {
+                                
+                                sum_distance += distance_raw;
+                                valid_count++;
+                                
+                                if (distance_raw < min_distance) min_distance = distance_raw;
+                                if (distance_raw > max_distance) max_distance = distance_raw;
+                            }
+                        }
+                    }
+                    
+                    // Debug: Ausgabe der Rohdaten für jeden Punkt
+                    debug_print("\n----------------------------------------\n");
+                    debug_print("DEBUG Point %s Raw Values (Timestamp: %ld):\n", 
+                               points[i].name, time(NULL));
+                    for (int y = 0; y < AREA_SIZE; y++) {
+                        debug_print("  ");
+                        for (int x = 0; x < AREA_SIZE; x++) {
+                            debug_print("%5d ", raw_values[y * AREA_SIZE + x]);
+                        }
+                        debug_print("\n");
+                    }
+                    debug_print("Valid pixels: %d/%d\n", valid_count, AREA_SIZE * AREA_SIZE);
+                    debug_print("Min distance: %.1f mm\n", min_distance);
+                    debug_print("Max distance: %.1f mm\n", max_distance);
+                    if (valid_count > 0) {
+                        debug_print("Average distance: %.1f mm\n", sum_distance / valid_count);
+                    }
+                    debug_print("----------------------------------------\n");
+                    
+                    // Messung ist gültig wenn mindestens die konfigurierte Anzahl Pixel gültig sind
+                    if (valid_count >= min_valid_pixels) {
+                        points[i].distance = sum_distance / valid_count;
+                        points[i].min_distance = min_distance;
+                        points[i].max_distance = max_distance;
+                        points[i].valid_pixels = valid_count;
+                        points[i].flags.valid = 1; // Update bitfield
+                        points[i].timestamp = time(NULL); // Update timestamp
+                        
+                        debug_print("Messung gültig: %d/%d Pixel (min: %d)\n", 
+                                  valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
+                    } else {
+                        points[i].flags.valid = 0; // Update bitfield
+                        points[i].valid_pixels = valid_count;
+                        
+                        debug_print("Messung ungültig: %d/%d Pixel (min: %d)\n", 
+                                  valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
+                    }
+                }
+            }
+            
+            pthread_mutex_unlock(&data_mutex);
+            return 0;
+        }
+        
+        debug_print("WARNUNG: Messung fehlgeschlagen (Code: %d, Versuch: %d/3)\n", ret, retry + 1);
         
         // Bei schwerwiegenden Fehlern versuchen wir einen Reconnect
         if (ret == HPS3D_RET_ERROR || ret == HPS3D_RET_CONNECT_FAILED || 
@@ -270,95 +365,15 @@ int measure_points() {
                 return -1;
             }
             debug_print("Reconnect erfolgreich\n");
-            return 0;  // Nächsten Messzyklus abwarten
+            continue;  // Try measurement again after reconnect
         }
-        return -1;
+        
+        // For timeout or other errors, just wait a bit longer before retry
+        usleep(100000);  // 100ms pause between retries
     }
 
-    pthread_mutex_lock(&data_mutex);
-    
-    // Alle 4 Punkte messen
-    if (event_type == HPS3D_FULL_DEPTH_EVEN) {
-        for (int i = 0; i < MAX_POINTS; i++) {
-            int center_x = points[i].x;
-            int center_y = points[i].y;
-            float sum_distance = 0;
-            int valid_count = 0;
-            float min_distance = 65000;
-            float max_distance = 0;
-            
-            // Debug: Array für Rohdaten
-            uint16_t raw_values[AREA_SIZE * AREA_SIZE];
-            int raw_idx = 0;
-            
-            // 5x5 Bereich um den Punkt messen
-            for (int dy = -AREA_OFFSET; dy <= AREA_OFFSET; dy++) {
-                for (int dx = -AREA_OFFSET; dx <= AREA_OFFSET; dx++) {
-                    int x = center_x + dx;
-                    int y = center_y + dy;
-                    int pixel_index = y * 160 + x;
-                    
-                    uint16_t distance_raw = g_measureData.full_depth_data.distance[pixel_index];
-                    raw_values[raw_idx++] = distance_raw;
-                    
-                    // Erweiterte Gültigkeitsprüfung
-                    if (distance_raw > 0 && distance_raw < 65000 && 
-                        distance_raw != HPS3D_LOW_AMPLITUDE && 
-                        distance_raw != HPS3D_SATURATION && 
-                        distance_raw != HPS3D_ADC_OVERFLOW && 
-                        distance_raw != HPS3D_INVALID_DATA) {
-                        
-                        sum_distance += distance_raw;
-                        valid_count++;
-                        
-                        if (distance_raw < min_distance) min_distance = distance_raw;
-                        if (distance_raw > max_distance) max_distance = distance_raw;
-                    }
-                }
-            }
-            
-            // Debug: Ausgabe der Rohdaten für jeden Punkt
-            debug_print("\n----------------------------------------\n");
-            debug_print("DEBUG Point %s Raw Values (Timestamp: %ld):\n", 
-                       points[i].name, time(NULL));
-            for (int y = 0; y < AREA_SIZE; y++) {
-                debug_print("  ");
-                for (int x = 0; x < AREA_SIZE; x++) {
-                    debug_print("%5d ", raw_values[y * AREA_SIZE + x]);
-                }
-                debug_print("\n");
-            }
-            debug_print("Valid pixels: %d/%d\n", valid_count, AREA_SIZE * AREA_SIZE);
-            debug_print("Min distance: %.1f mm\n", min_distance);
-            debug_print("Max distance: %.1f mm\n", max_distance);
-            if (valid_count > 0) {
-                debug_print("Average distance: %.1f mm\n", sum_distance / valid_count);
-            }
-            debug_print("----------------------------------------\n");
-            
-            // Messung ist gültig wenn mindestens die konfigurierte Anzahl Pixel gültig sind
-            if (valid_count >= min_valid_pixels) {
-                points[i].distance = sum_distance / valid_count;
-                points[i].min_distance = min_distance;
-                points[i].max_distance = max_distance;
-                points[i].valid_pixels = valid_count;
-                points[i].flags.valid = 1; // Update bitfield
-                points[i].timestamp = time(NULL); // Update timestamp
-                
-                debug_print("Messung gültig: %d/%d Pixel (min: %d)\n", 
-                          valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
-            } else {
-                points[i].flags.valid = 0; // Update bitfield
-                points[i].valid_pixels = valid_count;
-                
-                debug_print("Messung ungültig: %d/%d Pixel (min: %d)\n", 
-                          valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
-            }
-        }
-    }
-    
-    pthread_mutex_unlock(&data_mutex);
-    return 0;
+    debug_print("FEHLER: Messung nach 3 Versuchen fehlgeschlagen\n");
+    return -1;
 }
 
 // JSON String für Output erstellen
@@ -929,9 +944,6 @@ void cleanup(void) {
 
 // Hauptprogramm
 int main(int argc, char *argv[]) {
-    // Debug sofort aktivieren
-    debug_print("HPS3D-160 LIDAR Service startet...\n");
-    
     // Signal Handler
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -940,6 +952,10 @@ int main(int argc, char *argv[]) {
     if (argc > 1 && strcmp(argv[1], "-d") == 0) {
         daemon(0, 0);
     }
+    
+    // Debug sofort aktivieren und Service-Start loggen
+    debug_enabled = DEFAULT_DEBUG_ENABLED;
+    debug_print("HPS3D-160 LIDAR Service startet...\n");
     
     // Konfiguration laden
     if (load_config() < 0) {
