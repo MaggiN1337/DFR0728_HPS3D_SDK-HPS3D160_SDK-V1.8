@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <math.h>
+#include <stdarg.h> // Für va_list, va_start, va_end
 
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
@@ -32,6 +33,7 @@
 #define OUTPUT_INTERVAL_MS 2000  // 1 Hz Output für NodeRed
 #define CONFIG_FILE "/etc/hps3d/points.conf"
 #define PID_FILE "/var/run/hps3d_service.pid"
+#define DEBUG_FILE "hps3d_debug.log"  // Debug-Ausgaben in diese Datei
 #define USB_PORT "/dev/ttyACM0"  // Standard USB Port für HPS3D-160
 
 // Globale Variablen
@@ -40,6 +42,18 @@ static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_handle = -1;
 static HPS3D_MeasureData_t g_measureData;
 static bool reconnect_needed = false;
+static FILE* debug_file = NULL;  // File handle für Debug-Ausgaben
+
+// Debug-Ausgabe Funktion
+void debug_print(const char* format, ...) {
+    if (debug_file) {
+        va_list args;
+        va_start(args, format);
+        vfprintf(debug_file, format, args);
+        fflush(debug_file);  // Sofort in Datei schreiben
+        va_end(args);
+    }
+}
 
 // Messpunkt Definition
 typedef struct {
@@ -220,15 +234,23 @@ int measure_points() {
             }
             
             // Debug: Ausgabe der Rohdaten für jeden Punkt
-            printf("DEBUG Point %s Raw Values:\n", points[i].name);
+            debug_print("\n----------------------------------------\n");
+            debug_print("DEBUG Point %s Raw Values (Timestamp: %ld):\n", 
+                       points[i].name, time(NULL));
             for (int y = 0; y < AREA_SIZE; y++) {
-                printf("  ");
+                debug_print("  ");
                 for (int x = 0; x < AREA_SIZE; x++) {
-                    printf("%5d ", raw_values[y * AREA_SIZE + x]);
+                    debug_print("%5d ", raw_values[y * AREA_SIZE + x]);
                 }
-                printf("\n");
+                debug_print("\n");
             }
-            printf("Valid pixels: %d/%d\n", valid_count, AREA_SIZE * AREA_SIZE);
+            debug_print("Valid pixels: %d/%d\n", valid_count, AREA_SIZE * AREA_SIZE);
+            debug_print("Min distance: %.1f mm\n", min_distance);
+            debug_print("Max distance: %.1f mm\n", max_distance);
+            if (valid_count > 0) {
+                debug_print("Average distance: %.1f mm\n", sum_distance / valid_count);
+            }
+            debug_print("----------------------------------------\n");
             
             // Messung ist gültig wenn mindestens 25% der Pixel gültig sind (weniger streng)
             int required_valid_pixels = (AREA_SIZE * AREA_SIZE) / 4;
@@ -324,7 +346,7 @@ int create_pid_file() {
 
 // Cleanup
 void cleanup() {
-    printf("Cleanup...\n");
+    debug_print("Cleanup...\n");
     
     if (g_handle >= 0) {
         HPS3D_StopCapture(g_handle);
@@ -336,12 +358,18 @@ void cleanup() {
     
     unlink(PID_FILE);
     
-    printf("Service beendet\n");
+    debug_print("Service beendet\n");
 }
 
 // Hauptprogramm
 int main(int argc, char *argv[]) {
     printf("HPS3D-160 LIDAR Service gestartet\n");
+    
+    // Debug-Datei öffnen
+    debug_file = fopen(DEBUG_FILE, "w");
+    if (!debug_file) {
+        printf("WARNUNG: Debug-Datei konnte nicht geöffnet werden\n");
+    }
     
     // Signal Handler
     signal(SIGINT, signal_handler);
@@ -384,5 +412,11 @@ int main(int argc, char *argv[]) {
     pthread_join(output_tid, NULL);
     
     cleanup();
+    
+    // Debug-Datei schließen
+    if (debug_file) {
+        fclose(debug_file);
+    }
+    
     return 0;
 }
