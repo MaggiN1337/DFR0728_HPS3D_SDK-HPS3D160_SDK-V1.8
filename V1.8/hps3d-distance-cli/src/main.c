@@ -20,7 +20,10 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <math.h>
-#include <stdarg.h> // Für va_list, va_start, va_end
+#include <stdarg.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <mosquitto.h>
 
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
@@ -34,8 +37,18 @@
 #define OUTPUT_INTERVAL_MS 1000  // 1 Hz Output für NodeRed
 #define CONFIG_FILE "/etc/hps3d/points.conf"
 #define PID_FILE "/var/run/hps3d_service.pid"
-#define DEFAULT_DEBUG_FILE "debug_hps3d.log"  // Standard Debug-Datei
-#define USB_PORT "/dev/ttyACM0"  // Standard USB Port für HPS3D-160
+#define DEFAULT_DEBUG_FILE "debug_hps3d.log"
+#define USB_PORT "/dev/ttyACM0"
+
+// HTTP Server Konfiguration
+#define HTTP_PORT 8080
+#define HTTP_RESPONSE "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: application/json\r\n\r\n%s"
+
+// MQTT Konfiguration
+#define MQTT_HOST "localhost"
+#define MQTT_PORT 1883
+#define MQTT_TOPIC "hps3d/measurements"
+#define MQTT_CONTROL_TOPIC "hps3d/control"
 
 // Globale Variablen
 static int running = 1;
@@ -46,6 +59,11 @@ static bool reconnect_needed = false;
 static FILE* debug_file = NULL;  // File handle für Debug-Ausgaben
 static int debug_enabled = 0;    // Debug-Status aus Konfiguration
 static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;  // Minimale Anzahl gültiger Pixel
+
+// Globale Variablen für MQTT und HTTP
+static struct mosquitto *mosq = NULL;
+static int http_socket = -1;
+static int measurement_active = 1;  // Messungen standardmäßig aktiv
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
@@ -318,62 +336,205 @@ int measure_points() {
     return 0;
 }
 
-// JSON Output für NodeRed
-void output_json() {
+// JSON String für Output erstellen
+char* create_json_output() {
+    static char json_buffer[4096];
     pthread_mutex_lock(&data_mutex);
     
-    printf("{\n");
-    printf("  \"timestamp\": %ld,\n", time(NULL));
-    printf("  \"measurements\": {\n");
+    snprintf(json_buffer, sizeof(json_buffer),
+        "{"
+        "\"timestamp\": %ld,"
+        "\"active\": %s,"
+        "\"measurements\": {",
+        time(NULL),
+        measurement_active ? "true" : "false"
+    );
     
     for (int i = 0; i < MAX_POINTS; i++) {
-        printf("    \"%s\": {\n", points[i].name);
-        printf("      \"distance_mm\": %.1f,\n", points[i].distance);
-        printf("      \"distance_m\": %.3f,\n", points[i].distance / 1000.0);
-        printf("      \"min_distance_mm\": %.1f,\n", points[i].min_distance);
-        printf("      \"max_distance_mm\": %.1f,\n", points[i].max_distance);
-        printf("      \"valid_pixels\": %d,\n", points[i].valid_pixels);
-        printf("      \"valid\": %s,\n", points[i].valid ? "true" : "false");
-        printf("      \"age_seconds\": %ld,\n", time(NULL) - points[i].timestamp);
-        printf("      \"coordinates\": {\"x\": %d, \"y\": %d}\n", points[i].x, points[i].y);
-        printf("    }%s\n", (i < MAX_POINTS-1) ? "," : "");
+        char point_json[512];
+        snprintf(point_json, sizeof(point_json),
+            "\"%s\": {"
+            "\"distance_mm\": %.1f,"
+            "\"distance_m\": %.3f,"
+            "\"min_distance_mm\": %.1f,"
+            "\"max_distance_mm\": %.1f,"
+            "\"valid_pixels\": %d,"
+            "\"valid\": %s,"
+            "\"age_seconds\": %ld,"
+            "\"coordinates\": {\"x\": %d, \"y\": %d}"
+            "}%s",
+            points[i].name,
+            points[i].distance,
+            points[i].distance / 1000.0,
+            points[i].min_distance,
+            points[i].max_distance,
+            points[i].valid_pixels,
+            points[i].valid ? "true" : "false",
+            time(NULL) - points[i].timestamp,
+            points[i].x, points[i].y,
+            (i < MAX_POINTS-1) ? "," : ""
+        );
+        strcat(json_buffer, point_json);
     }
     
-    printf("  }\n");
-    printf("}\n");
-    fflush(stdout);
-    
+    strcat(json_buffer, "}}");
     pthread_mutex_unlock(&data_mutex);
-}
-
-// Mess-Thread
-void* measure_thread(void* arg) {
-    while (running) {
-        if (reconnect_needed) {
-            HPS3D_CloseDevice(g_handle);
-            sleep(1);  // Kurz warten vor Reconnect
-            if (init_lidar() == 0) {
-                reconnect_needed = false;
-                printf("HPS3D-160 erfolgreich neu verbunden\n");
-            }
-            continue;
-        }
-
-        if (measure_points() != 0) {
-            usleep(500000); // 500ms Pause bei Fehler
-        } else {
-            usleep(MEASURE_INTERVAL_MS * 1000);
-        }
-    }
-    return NULL;
+    
+    return json_buffer;
 }
 
 // Output-Thread
 void* output_thread(void* arg) {
     while (running) {
-        output_json();
+        char* json_output = create_json_output();
+        
+        // Ausgabe auf stdout
+        printf("%s\n", json_output);
+        fflush(stdout);
+        
+        // MQTT Publish wenn verbunden
+        if (mosq) {
+            int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json_output), json_output, 0, false);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
+            }
+        }
+        
         usleep(OUTPUT_INTERVAL_MS * 1000);
     }
+    return NULL;
+}
+
+// MQTT Callback für Control Messages
+void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message) {
+    if (strcmp(message->topic, MQTT_CONTROL_TOPIC) == 0) {
+        if (strncmp(message->payload, "start", message->payloadlen) == 0) {
+            measurement_active = 1;
+            debug_print("Messung aktiviert via MQTT\n");
+        } else if (strncmp(message->payload, "stop", message->payloadlen) == 0) {
+            measurement_active = 0;
+            debug_print("Messung deaktiviert via MQTT\n");
+        }
+    }
+}
+
+// MQTT Initialisierung
+int init_mqtt() {
+    mosquitto_lib_init();
+    mosq = mosquitto_new(NULL, true, NULL);
+    if (!mosq) {
+        printf("FEHLER: MQTT Client konnte nicht erstellt werden\n");
+        return -1;
+    }
+
+    mosquitto_message_callback_set(mosq, mqtt_message_callback);
+
+    if (mosquitto_connect(mosq, MQTT_HOST, MQTT_PORT, 60) != MOSQ_ERR_SUCCESS) {
+        printf("WARNUNG: MQTT Verbindung fehlgeschlagen - verwende nur HTTP\n");
+        mosquitto_destroy(mosq);
+        mosq = NULL;
+        return -1;
+    }
+
+    // Subscribe to control topic
+    if (mosquitto_subscribe(mosq, NULL, MQTT_CONTROL_TOPIC, 0) != MOSQ_ERR_SUCCESS) {
+        printf("WARNUNG: MQTT Subscribe fehlgeschlagen\n");
+        return -1;
+    }
+
+    // Start MQTT loop in background
+    if (mosquitto_loop_start(mosq) != MOSQ_ERR_SUCCESS) {
+        printf("WARNUNG: MQTT Loop konnte nicht gestartet werden\n");
+        return -1;
+    }
+
+    printf("MQTT Client verbunden mit %s:%d\n", MQTT_HOST, MQTT_PORT);
+    return 0;
+}
+
+// HTTP Server initialisieren
+int init_http_server() {
+    struct sockaddr_in server_addr;
+    
+    http_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (http_socket < 0) {
+        printf("FEHLER: HTTP Socket konnte nicht erstellt werden\n");
+        return -1;
+    }
+    
+    int opt = 1;
+    setsockopt(http_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(HTTP_PORT);
+    
+    if (bind(http_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        printf("FEHLER: HTTP Socket konnte nicht gebunden werden\n");
+        return -1;
+    }
+    
+    if (listen(http_socket, 3) < 0) {
+        printf("FEHLER: HTTP Server konnte nicht gestartet werden\n");
+        return -1;
+    }
+    
+    printf("HTTP Server läuft auf Port %d\n", HTTP_PORT);
+    return 0;
+}
+
+// HTTP Request Handler
+void* http_server_thread(void* arg) {
+    char buffer[1024];
+    char response[1024];
+    
+    while (running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        
+        int client_socket = accept(http_socket, (struct sockaddr *)&client_addr, &client_len);
+        if (client_socket < 0) continue;
+        
+        ssize_t bytes_read = read(client_socket, buffer, sizeof(buffer)-1);
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0';
+            
+            // Parse HTTP request
+            if (strstr(buffer, "GET /status") != NULL) {
+                // Status Abfrage
+                snprintf(response, sizeof(response), 
+                        "{\"active\": %s, \"connected\": %s}", 
+                        measurement_active ? "true" : "false",
+                        HPS3D_IsConnect(g_handle) ? "true" : "false");
+            }
+            else if (strstr(buffer, "POST /start") != NULL) {
+                // Messung starten
+                measurement_active = 1;
+                snprintf(response, sizeof(response), "{\"status\": \"started\"}");
+                debug_print("Messung aktiviert via HTTP\n");
+            }
+            else if (strstr(buffer, "POST /stop") != NULL) {
+                // Messung stoppen
+                measurement_active = 0;
+                snprintf(response, sizeof(response), "{\"status\": \"stopped\"}");
+                debug_print("Messung deaktiviert via HTTP\n");
+            }
+            else {
+                // Unbekannter Befehl
+                snprintf(response, sizeof(response), "{\"error\": \"unknown command\"}");
+            }
+            
+            // HTTP Response senden
+            char http_response[2048];
+            snprintf(http_response, sizeof(http_response), HTTP_RESPONSE, 
+                    strlen(response), response);
+            write(client_socket, http_response, strlen(http_response));
+        }
+        
+        close(client_socket);
+    }
+    
     return NULL;
 }
 
@@ -399,10 +560,25 @@ void cleanup() {
         HPS3D_CloseDevice(g_handle);
     }
     
+    if (mosq) {
+        mosquitto_loop_stop(mosq, true);
+        mosquitto_disconnect(mosq);
+        mosquitto_destroy(mosq);
+        mosquitto_lib_cleanup();
+    }
+    
+    if (http_socket >= 0) {
+        close(http_socket);
+    }
+    
     HPS3D_MeasureDataFree(&g_measureData);
     HPS3D_UnregisterEventCallback();
     
     unlink(PID_FILE);
+    
+    if (debug_file) {
+        fclose(debug_file);
+    }
     
     debug_print("Service beendet\n");
 }
@@ -426,6 +602,15 @@ int main(int argc, char *argv[]) {
     // Konfiguration laden
     load_config();
     
+    // MQTT initialisieren
+    init_mqtt();
+    
+    // HTTP Server starten
+    if (init_http_server() != 0) {
+        cleanup();
+        return 1;
+    }
+    
     // LIDAR initialisieren
     if (init_lidar() != 0) {
         cleanup();
@@ -433,7 +618,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Threads starten
-    pthread_t measure_tid, output_tid;
+    pthread_t measure_tid, output_tid, http_tid;
     
     if (pthread_create(&measure_tid, NULL, measure_thread, NULL) != 0) {
         printf("FEHLER: Mess-Thread konnte nicht erstellt werden\n");
@@ -447,9 +632,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    if (pthread_create(&http_tid, NULL, http_server_thread, NULL) != 0) {
+        printf("FEHLER: HTTP-Thread konnte nicht erstellt werden\n");
+        cleanup();
+        return 1;
+    }
+    
     // Auf Threads warten
     pthread_join(measure_tid, NULL);
     pthread_join(output_tid, NULL);
+    pthread_join(http_tid, NULL);
     
     cleanup();
     return 0;
