@@ -64,6 +64,7 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define MQTT_PORT 1883
 #define MQTT_TOPIC "hps3d/measurements"
 #define MQTT_CONTROL_TOPIC "hps3d/control"
+#define MQTT_POINTCLOUD_TOPIC "hps3d/pointcloud"  // Neues Topic für Punktwolke
 #define MQTT_RECONNECT_DELAY 5  // Sekunden zwischen Reconnect-Versuchen
 
 // Globale Variablen
@@ -79,6 +80,7 @@ static struct mosquitto *mosq = NULL;
 static int http_socket = -1;
 static volatile int measurement_active = 0;  // Start deaktiviert
 static volatile int mqtt_connected = 0;
+static volatile int pointcloud_requested = 0;  // Neue Variable für Punktwolken-Request
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
@@ -458,30 +460,32 @@ void* output_thread(void* arg) {
     (void)arg;  // Ungenutzte Parameter markieren
     
     while (running) {
-        char* json_output = create_json_output();
-        
-        // Ausgabe auf stdout
-        printf("%s\n", json_output);
-        fflush(stdout);
-        
-        // MQTT Publish wenn verbunden
-        if (mosq && mqtt_connected) {
-            int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json_output), json_output, 0, false);
-            if (rc != MOSQ_ERR_SUCCESS) {
-                debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
+        // Normale Messpunkte ausgeben wenn aktiv
+        if (measurement_active) {
+            char* json_output = create_json_output();
+            
+            // Ausgabe auf stdout
+            printf("%s\n", json_output);
+            fflush(stdout);
+            
+            // MQTT Publish wenn verbunden
+            if (mosq && mqtt_connected) {
+                int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json_output), json_output, 0, false);
+                if (rc != MOSQ_ERR_SUCCESS) {
+                    debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
+                }
             }
         }
         
-        // Punktwolke alle 2 Sekunden senden
-        static time_t last_cloud_time = 0;
-        time_t now = time(NULL);
-        if (now - last_cloud_time >= 2) {
+        // Punktwolke bei Anforderung senden
+        if (pointcloud_requested) {
             char* cloud_json = create_pointcloud_json();
             if (mosq && mqtt_connected) {
-                mosquitto_publish(mosq, NULL, MQTT_TOPIC "/pointcloud", 
+                mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
                                 strlen(cloud_json), cloud_json, 0, false);
+                debug_print("Punktwolke gesendet\n");
             }
-            last_cloud_time = now;
+            pointcloud_requested = 0;  // Request zurücksetzen
         }
         
         usleep(OUTPUT_INTERVAL_MS * 1000);
@@ -501,6 +505,9 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
         } else if (strncmp(message->payload, "stop", message->payloadlen) == 0) {
             measurement_active = 0;
             debug_print("Messung deaktiviert via MQTT\n");
+        } else if (strncmp(message->payload, "get_pointcloud", message->payloadlen) == 0) {
+            pointcloud_requested = 1;
+            debug_print("Punktwolke angefordert via MQTT\n");
         }
     }
 }
