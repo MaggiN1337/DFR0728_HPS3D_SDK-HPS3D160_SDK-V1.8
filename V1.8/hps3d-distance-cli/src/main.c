@@ -415,6 +415,8 @@ char* create_pointcloud_json() {
     static char json_buffer[160*60*10];  // Genug Platz für alle Pixel
     pthread_mutex_lock(&data_mutex);
     
+    debug_print("Creating pointcloud JSON...\n");
+    
     snprintf(json_buffer, sizeof(json_buffer),
         "{"
         "\"timestamp\": %ld,"
@@ -425,6 +427,7 @@ char* create_pointcloud_json() {
         160, 60
     );
     
+    int valid_points = 0;
     // Alle Pixel durchgehen
     for (int y = 0; y < 60; y++) {
         for (int x = 0; x < 160; x++) {
@@ -441,10 +444,11 @@ char* create_pointcloud_json() {
                 char point_json[64];
                 snprintf(point_json, sizeof(point_json),
                     "%s{\"x\":%d,\"y\":%d,\"d\":%d}",
-                    (pixel_index > 0 ? "," : ""),  // Komma außer beim ersten Element
+                    (valid_points > 0 ? "," : ""),  // Komma außer beim ersten Element
                     x, y, distance
                 );
                 strcat(json_buffer, point_json);
+                valid_points++;
             }
         }
     }
@@ -452,6 +456,7 @@ char* create_pointcloud_json() {
     strcat(json_buffer, "]}");
     pthread_mutex_unlock(&data_mutex);
     
+    debug_print("Pointcloud JSON created with %d valid points\n", valid_points);
     return json_buffer;
 }
 
@@ -479,11 +484,23 @@ void* output_thread(void* arg) {
         
         // Punktwolke bei Anforderung senden
         if (pointcloud_requested) {
-            char* cloud_json = create_pointcloud_json();
-            if (mosq && mqtt_connected) {
-                mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
-                                strlen(cloud_json), cloud_json, 0, false);
-                debug_print("Punktwolke gesendet\n");
+            debug_print("Pointcloud requested, capturing data...\n");
+            
+            // Stelle sicher, dass wir aktuelle Daten haben
+            if (measure_points() == 0) {
+                char* cloud_json = create_pointcloud_json();
+                if (mosq && mqtt_connected) {
+                    debug_print("Publishing pointcloud data...\n");
+                    int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
+                                    strlen(cloud_json), cloud_json, 0, false);
+                    if (rc != MOSQ_ERR_SUCCESS) {
+                        debug_print("Failed to publish pointcloud: %d\n", rc);
+                    } else {
+                        debug_print("Pointcloud published successfully\n");
+                    }
+                }
+            } else {
+                debug_print("Failed to capture pointcloud data\n");
             }
             pointcloud_requested = 0;  // Request zurücksetzen
         }
