@@ -28,6 +28,11 @@
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
 
+// Forward declarations für Thread-Funktionen
+void* measure_thread(void* arg);
+void* output_thread(void* arg);
+void* http_server_thread(void* arg);
+
 // Konfiguration
 #define MAX_POINTS 4
 #define AREA_SIZE 5        // 5x5 Pixel Messbereich
@@ -98,15 +103,25 @@ static MeasurePoint points[MAX_POINTS] = {
 
 // Event Callback für HPS3D
 static void EventCallBackFunc(int handle, int eventType, uint8_t *data, int dataLen, void *userPara) {
-    switch ((HPS3D_EventType_t)eventType) {
+    (void)handle;    // Ungenutzte Parameter markieren
+    (void)dataLen;
+    (void)userPara;
+    
+    HPS3D_EventType_t event = (HPS3D_EventType_t)eventType;
+    switch (event) {
         case HPS3D_DISCONNECT_EVEN:
             printf("WARNUNG: HPS3D-160 getrennt, versuche Wiederverbindung...\n");
             reconnect_needed = true;
             break;
         case HPS3D_SYS_EXCEPTION_EVEN:
-            printf("WARNUNG: System Exception: %s\n", data);
+            if (data) {
+                printf("WARNUNG: System Exception: %s\n", (char*)data);
+            } else {
+                printf("WARNUNG: System Exception (keine Details verfügbar)\n");
+            }
             break;
         default:
+            printf("WARNUNG: Unbekanntes Event: %d\n", eventType);
             break;
     }
 }
