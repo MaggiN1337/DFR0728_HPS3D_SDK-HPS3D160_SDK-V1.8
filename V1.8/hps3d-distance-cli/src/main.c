@@ -67,20 +67,20 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define MQTT_POINTCLOUD_TOPIC "hps3d/pointcloud"  // Neues Topic für Punktwolke
 #define MQTT_RECONNECT_DELAY 5  // Sekunden zwischen Reconnect-Versuchen
 
-// Globale Variablen
+// Globale Variablen am Anfang der Datei
 static volatile int running = 1;
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_handle = -1;
-static HPS3D_MeasureData_t g_measureData;
+static HPS3D_MeasureData_t g_measureData = {0};  // Initialisiere mit 0
 static volatile bool reconnect_needed = false;
 static FILE* debug_file = NULL;
-static int debug_enabled = 0;
+static int debug_enabled = 1;  // Debug standardmäßig aktiviert
 static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;
 static struct mosquitto *mosq = NULL;
 static int http_socket = -1;
-static volatile int measurement_active = 0;  // Start deaktiviert
+static volatile int measurement_active = 0;
+static volatile int pointcloud_requested = 0;
 static volatile int mqtt_connected = 0;
-static volatile int pointcloud_requested = 0;  // Neue Variable für Punktwolken-Request
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
@@ -239,33 +239,37 @@ int load_config() {
 int init_lidar() {
     HPS3D_StatusTypeDef ret;
 
+    debug_print("Initialisiere LIDAR...\n");
+
     // Messdatenstruktur initialisieren
     ret = HPS3D_MeasureDataInit(&g_measureData);
     if (ret != HPS3D_RET_OK) {
-        printf("FEHLER: Messdatenstruktur konnte nicht initialisiert werden\n");
+        debug_print("FEHLER: Messdatenstruktur konnte nicht initialisiert werden\n");
         return -1;
     }
+
+    debug_print("Messdatenstruktur initialisiert\n");
 
     // Callback registrieren
     ret = HPS3D_RegisterEventCallback(EventCallBackFunc, NULL);
     if (ret != HPS3D_RET_OK) {
-        printf("FEHLER: Callback-Registrierung fehlgeschlagen\n");
+        debug_print("FEHLER: Callback-Registrierung fehlgeschlagen\n");
         return -1;
     }
 
     // USB Verbindung aufbauen
     ret = HPS3D_USBConnectDevice(USB_PORT, &g_handle);
     if (ret != HPS3D_RET_OK) {
-        printf("FEHLER: Verbindung zu HPS3D-160 fehlgeschlagen (%d)\n", ret);
+        debug_print("FEHLER: Verbindung zu HPS3D-160 fehlgeschlagen (%d)\n", ret);
         return -1;
     }
 
-    printf("HPS3D-160 verbunden: %s\n", HPS3D_GetDeviceVersion(g_handle));
+    debug_print("LIDAR verbunden: %s\n", HPS3D_GetDeviceVersion(g_handle));
 
     // Weniger aggressive Filtereinstellungen
-    HPS3D_SetDistanceFilterConf(g_handle, false, 0.1f);  // Distanzfilter deaktiviert
-    HPS3D_SetSmoothFilterConf(g_handle, HPS3D_SMOOTH_FILTER_DISABLE, 0);  // Glättungsfilter deaktiviert
-    HPS3D_SetEdgeFilterEnable(g_handle, false);  // Kantenfilter deaktiviert
+    HPS3D_SetDistanceFilterConf(g_handle, false, 0.1f);
+    HPS3D_SetSmoothFilterConf(g_handle, HPS3D_SMOOTH_FILTER_DISABLE, 0);
+    HPS3D_SetEdgeFilterEnable(g_handle, false);
     
     // Optische Wegkorrektur aktivieren für genauere Messungen
     HPS3D_SetOpticalPathCalibration(g_handle, true);
@@ -273,11 +277,11 @@ int init_lidar() {
     // Messung starten
     ret = HPS3D_StartCapture(g_handle);
     if (ret != HPS3D_RET_OK) {
-        printf("FEHLER: Messung konnte nicht gestartet werden\n");
+        debug_print("FEHLER: Messung konnte nicht gestartet werden\n");
         return -1;
     }
 
-    printf("LIDAR initialisiert und gestartet\n");
+    debug_print("LIDAR initialisiert und gestartet\n");
     return 0;
 }
 
@@ -677,32 +681,48 @@ int init_mqtt(void) {
 // HTTP Server initialisieren
 int init_http_server() {
     struct sockaddr_in server_addr;
+    int opt = 1;
     
+    debug_print("Initialisiere HTTP Server...\n");
+    
+    // Socket erstellen
     http_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (http_socket < 0) {
-        printf("FEHLER: HTTP Socket konnte nicht erstellt werden\n");
+        debug_print("FEHLER: HTTP Socket konnte nicht erstellt werden\n");
         return -1;
     }
     
-    int opt = 1;
-    setsockopt(http_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // Socket-Optionen setzen
+    if (setsockopt(http_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        debug_print("FEHLER: Socket-Optionen konnten nicht gesetzt werden\n");
+        close(http_socket);
+        return -1;
+    }
     
+    // Server-Adresse vorbereiten
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(HTTP_PORT);
     
+    // Socket binden
     if (bind(http_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        printf("FEHLER: HTTP Socket konnte nicht gebunden werden\n");
-        return -1;
+        debug_print("FEHLER: HTTP Socket konnte nicht gebunden werden (Port %d möglicherweise belegt)\n", HTTP_PORT);
+        close(http_socket);
+        http_socket = -1;
+        // Wir geben hier 0 zurück, damit der Service trotzdem startet
+        return 0;
     }
     
+    // Auf Verbindungen warten
     if (listen(http_socket, 3) < 0) {
-        printf("FEHLER: HTTP Server konnte nicht gestartet werden\n");
-        return -1;
+        debug_print("FEHLER: HTTP Server konnte nicht gestartet werden\n");
+        close(http_socket);
+        http_socket = -1;
+        return 0;
     }
     
-    printf("HTTP Server läuft auf Port %d\n", HTTP_PORT);
+    debug_print("HTTP Server läuft auf Port %d\n", HTTP_PORT);
     return 0;
 }
 
@@ -841,7 +861,8 @@ void cleanup(void) {
 
 // Hauptprogramm
 int main(int argc, char *argv[]) {
-    printf("HPS3D-160 LIDAR Service gestartet (Messung initial deaktiviert)\n");
+    // Debug sofort aktivieren
+    debug_print("HPS3D-160 LIDAR Service startet...\n");
     
     // Signal Handler
     signal(SIGINT, signal_handler);
@@ -853,22 +874,21 @@ int main(int argc, char *argv[]) {
     }
     
     // PID-Datei erstellen
-    create_pid_file();
-    
-    // Konfiguration laden
-    load_config();
-    
-    // MQTT initialisieren
-    init_mqtt();
-    
-    // HTTP Server starten
-    if (init_http_server() != 0) {
-        cleanup();
-        return 1;
+    if (create_pid_file() != 0) {
+        debug_print("WARNUNG: PID-Datei konnte nicht erstellt werden\n");
     }
     
-    // LIDAR initialisieren aber noch nicht messen
+    // MQTT initialisieren
+    if (init_mqtt() != 0) {
+        debug_print("WARNUNG: MQTT konnte nicht initialisiert werden\n");
+    }
+    
+    // HTTP Server starten - Fehler werden toleriert
+    init_http_server();
+    
+    // LIDAR initialisieren
     if (init_lidar() != 0) {
+        debug_print("FEHLER: LIDAR konnte nicht initialisiert werden\n");
         cleanup();
         return 1;
     }
@@ -879,27 +899,30 @@ int main(int argc, char *argv[]) {
     pthread_t measure_tid, output_tid, http_tid;
     
     if (pthread_create(&measure_tid, NULL, measure_thread, NULL) != 0) {
-        printf("FEHLER: Mess-Thread konnte nicht erstellt werden\n");
+        debug_print("FEHLER: Mess-Thread konnte nicht erstellt werden\n");
         cleanup();
         return 1;
     }
     
     if (pthread_create(&output_tid, NULL, output_thread, NULL) != 0) {
-        printf("FEHLER: Output-Thread konnte nicht erstellt werden\n");
+        debug_print("FEHLER: Output-Thread konnte nicht erstellt werden\n");
         cleanup();
         return 1;
     }
     
-    if (pthread_create(&http_tid, NULL, http_server_thread, NULL) != 0) {
-        printf("FEHLER: HTTP-Thread konnte nicht erstellt werden\n");
-        cleanup();
-        return 1;
+    // HTTP-Thread nur starten wenn Socket erfolgreich erstellt wurde
+    if (http_socket >= 0) {
+        if (pthread_create(&http_tid, NULL, http_server_thread, NULL) != 0) {
+            debug_print("FEHLER: HTTP-Thread konnte nicht erstellt werden\n");
+            cleanup();
+            return 1;
+        }
+        pthread_join(http_tid, NULL);
     }
     
     // Auf Threads warten
     pthread_join(measure_tid, NULL);
     pthread_join(output_tid, NULL);
-    pthread_join(http_tid, NULL);
     
     cleanup();
     return 0;
