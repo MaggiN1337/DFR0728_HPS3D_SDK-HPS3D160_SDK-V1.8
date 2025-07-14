@@ -83,42 +83,61 @@ typedef struct {
     } flags;
 } MeasurePoint;
 
-// Globale Messpunkte
-static MeasurePoint points[MAX_POINTS] = {
-    {40, 30, 0.0, 0.0, 0.0, 0, 0, 0, "point_1"},   // Links-Oben
-    {120, 30, 0.0, 0.0, 0.0, 0, 0, 0, "point_2"},  // Rechts-Oben
-    {40, 45, 0.0, 0.0, 0.0, 0, 0, 0, "point_3"},   // Links-Unten
-    {120, 45, 0.0, 0.0, 0.0, 0, 0, 0, "point_4"}   // Rechts-Unten
-};
-
 // Globale Variablen am Anfang der Datei
 static volatile int running = 1;
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t debug_mutex = PTHREAD_MUTEX_INITIALIZER;  // Neue Mutex für Debug-Ausgaben
+static pthread_mutex_t debug_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_handle = -1;
 static HPS3D_MeasureData_t g_measureData = {0};
-static volatile _Atomic int measurement_active = 0;  // Atomic für Thread-Safety
+static struct mosquitto *mosq = NULL;
+static int http_socket = -1;
+static volatile _Atomic int measurement_active = 0;
 static volatile _Atomic int pointcloud_requested = 0;
 static volatile _Atomic int mqtt_connected = 0;
 int debug_enabled = DEFAULT_DEBUG_ENABLED;
 static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;
-static struct mosquitto *mosq = NULL;
-static int http_socket = -1;
-static volatile int measurement_active = 0;
-static volatile int pointcloud_requested = 0;
-static volatile int mqtt_connected = 0;
+static FILE* debug_file = NULL;  // Globale debug_file Variable
+
+// Globale Messpunkte mit korrekter Initialisierung
+static MeasurePoint points[MAX_POINTS] = {
+    {
+        .x = 40, .y = 30,
+        .distance = 0.0, .min_distance = 0.0, .max_distance = 0.0,
+        .valid_pixels = 0, .timestamp = 0,
+        .name = "point_1",
+        .flags = {.valid = 0}
+    },
+    {
+        .x = 120, .y = 30,
+        .distance = 0.0, .min_distance = 0.0, .max_distance = 0.0,
+        .valid_pixels = 0, .timestamp = 0,
+        .name = "point_2",
+        .flags = {.valid = 0}
+    },
+    {
+        .x = 40, .y = 45,
+        .distance = 0.0, .min_distance = 0.0, .max_distance = 0.0,
+        .valid_pixels = 0, .timestamp = 0,
+        .name = "point_3",
+        .flags = {.valid = 0}
+    },
+    {
+        .x = 120, .y = 45,
+        .distance = 0.0, .min_distance = 0.0, .max_distance = 0.0,
+        .valid_pixels = 0, .timestamp = 0,
+        .name = "point_4",
+        .flags = {.valid = 0}
+    }
+};
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
     if (!debug_enabled) return;
     
-    static FILE* debug_file = NULL;
-    static const int first_call = 1;
-    
     pthread_mutex_lock(&debug_mutex);
     
     // Beim ersten Aufruf Debug-File öffnen
-    if (first_call) {
+    if (!debug_file) {
         debug_file = fopen(DEFAULT_DEBUG_FILE, "w");
         if (!debug_file) {
             fprintf(stderr, "FEHLER: Debug-Datei konnte nicht geöffnet werden\n");
