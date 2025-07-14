@@ -28,10 +28,20 @@
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
 
-// Forward declarations für Thread-Funktionen
+// Forward declarations
+static int init_lidar(void);
+static int init_mqtt(void);
+static int init_http_server(void);
+static int measure_points(void);
+static char* create_json_output(void);
+static void cleanup(void);
+static int load_config(void);
+static int create_pid_file(void);
+
 void* measure_thread(void* arg);
 void* output_thread(void* arg);
 void* http_server_thread(void* arg);
+void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message);
 
 // Konfiguration
 #define MAX_POINTS 4
@@ -54,21 +64,21 @@ void* http_server_thread(void* arg);
 #define MQTT_PORT 1883
 #define MQTT_TOPIC "hps3d/measurements"
 #define MQTT_CONTROL_TOPIC "hps3d/control"
+#define MQTT_RECONNECT_DELAY 5  // Sekunden zwischen Reconnect-Versuchen
 
 // Globale Variablen
-static int running = 1;
+static volatile int running = 1;
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_handle = -1;
 static HPS3D_MeasureData_t g_measureData;
-static bool reconnect_needed = false;
-static FILE* debug_file = NULL;  // File handle für Debug-Ausgaben
-static int debug_enabled = 0;    // Debug-Status aus Konfiguration
-static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;  // Minimale Anzahl gültiger Pixel
-
-// Globale Variablen für MQTT und HTTP
+static volatile bool reconnect_needed = false;
+static FILE* debug_file = NULL;
+static int debug_enabled = 0;
+static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;
 static struct mosquitto *mosq = NULL;
 static int http_socket = -1;
-static int measurement_active = 1;  // Messungen standardmäßig aktiv
+static volatile int measurement_active = 1;
+static volatile int mqtt_connected = 0;
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
@@ -410,7 +420,7 @@ void* output_thread(void* arg) {
         fflush(stdout);
         
         // MQTT Publish wenn verbunden
-        if (mosq) {
+        if (mosq && mqtt_connected) {
             int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json_output), json_output, 0, false);
             if (rc != MOSQ_ERR_SUCCESS) {
                 debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
@@ -438,8 +448,36 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
     }
 }
 
-// MQTT Initialisierung
-int init_mqtt() {
+// MQTT Verbindungs-Callback
+void mqtt_connect_callback(struct mosquitto *mosq, void *userdata, int result) {
+    (void)mosq;
+    (void)userdata;
+    
+    if (!result) {
+        mqtt_connected = 1;
+        debug_print("MQTT: Verbindung hergestellt\n");
+        
+        // Resubscribe nach Reconnect
+        if (mosquitto_subscribe(mosq, NULL, MQTT_CONTROL_TOPIC, 0) != MOSQ_ERR_SUCCESS) {
+            debug_print("MQTT: Subscribe nach Reconnect fehlgeschlagen\n");
+        }
+    } else {
+        mqtt_connected = 0;
+        debug_print("MQTT: Verbindung fehlgeschlagen (%d)\n", result);
+    }
+}
+
+// MQTT Disconnect-Callback
+void mqtt_disconnect_callback(struct mosquitto *mosq, void *userdata, int rc) {
+    (void)mosq;
+    (void)userdata;
+    
+    mqtt_connected = 0;
+    debug_print("MQTT: Verbindung getrennt (%d)\n", rc);
+}
+
+// MQTT Initialisierung aktualisiert
+int init_mqtt(void) {
     mosquitto_lib_init();
     mosq = mosquitto_new(NULL, true, NULL);
     if (!mosq) {
@@ -447,12 +485,14 @@ int init_mqtt() {
         return -1;
     }
 
+    // Callbacks setzen
+    mosquitto_connect_callback_set(mosq, mqtt_connect_callback);
+    mosquitto_disconnect_callback_set(mosq, mqtt_disconnect_callback);
     mosquitto_message_callback_set(mosq, mqtt_message_callback);
 
+    // Verbindungsversuch
     if (mosquitto_connect(mosq, MQTT_HOST, MQTT_PORT, 60) != MOSQ_ERR_SUCCESS) {
         printf("WARNUNG: MQTT Verbindung fehlgeschlagen - verwende nur HTTP\n");
-        mosquitto_destroy(mosq);
-        mosq = NULL;
         return -1;
     }
 
@@ -601,9 +641,11 @@ int create_pid_file() {
     return 0;
 }
 
-// Cleanup
-void cleanup() {
+// Cleanup aktualisiert
+void cleanup(void) {
     debug_print("Cleanup...\n");
+    
+    running = 0;  // Threads stoppen
     
     if (g_handle >= 0) {
         HPS3D_StopCapture(g_handle);
@@ -611,8 +653,10 @@ void cleanup() {
     }
     
     if (mosq) {
+        if (mqtt_connected) {
+            mosquitto_disconnect(mosq);
+        }
         mosquitto_loop_stop(mosq, true);
-        mosquitto_disconnect(mosq);
         mosquitto_destroy(mosq);
         mosquitto_lib_cleanup();
     }
@@ -624,11 +668,11 @@ void cleanup() {
     HPS3D_MeasureDataFree(&g_measureData);
     HPS3D_UnregisterEventCallback();
     
-    unlink(PID_FILE);
-    
     if (debug_file) {
         fclose(debug_file);
     }
+    
+    unlink(PID_FILE);
     
     debug_print("Service beendet\n");
 }
