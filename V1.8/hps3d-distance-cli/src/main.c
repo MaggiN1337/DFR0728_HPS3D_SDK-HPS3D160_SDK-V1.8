@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <mosquitto.h>
+#include <stdatomic.h> // Required for _Atomic
 
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
@@ -53,6 +54,7 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define CONFIG_FILE "/etc/hps3d/points.conf"
 #define PID_FILE "/var/run/hps3d_service.pid"
 #define DEFAULT_DEBUG_FILE "/var/log/hps3d/debug.log"
+#define DEFAULT_DEBUG_ENABLED 1  // Debug standardmäßig aktiviert
 #define USB_PORT "/dev/ttyACM0"
 
 // HTTP Server Konfiguration
@@ -67,14 +69,38 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define MQTT_POINTCLOUD_TOPIC "hps3d/pointcloud"  // Neues Topic für Punktwolke
 #define MQTT_RECONNECT_DELAY 5  // Sekunden zwischen Reconnect-Versuchen
 
+// Messpunkt Definition
+typedef struct {
+    int x, y;           // Pixel-Koordinaten im 160x60 Array
+    float distance;     // Gemessene Durchschnittsdistanz in mm
+    float min_distance; // Minimale Distanz im Messbereich
+    float max_distance; // Maximale Distanz im Messbereich
+    int valid_pixels;   // Anzahl gültiger Pixel im Messbereich
+    uint32_t timestamp; // Zeitstempel der letzten Messung
+    char name[16];      // Name des Messpunkts (reduziert von 32 auf 16)
+    struct {
+        unsigned int valid : 1;  // Messung gültig (als Bitfeld)
+    } flags;
+} MeasurePoint;
+
+// Globale Messpunkte
+static MeasurePoint points[MAX_POINTS] = {
+    {40, 30, 0.0, 0.0, 0.0, 0, 0, 0, "point_1"},   // Links-Oben
+    {120, 30, 0.0, 0.0, 0.0, 0, 0, 0, "point_2"},  // Rechts-Oben
+    {40, 45, 0.0, 0.0, 0.0, 0, 0, 0, "point_3"},   // Links-Unten
+    {120, 45, 0.0, 0.0, 0.0, 0, 0, 0, "point_4"}   // Rechts-Unten
+};
+
 // Globale Variablen am Anfang der Datei
 static volatile int running = 1;
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t debug_mutex = PTHREAD_MUTEX_INITIALIZER;  // Neue Mutex für Debug-Ausgaben
 static int g_handle = -1;
-static HPS3D_MeasureData_t g_measureData = {0};  // Initialisiere mit 0
-static volatile bool reconnect_needed = false;
-static FILE* debug_file = NULL;
-static int debug_enabled = 1;  // Debug standardmäßig aktiviert
+static HPS3D_MeasureData_t g_measureData = {0};
+static volatile _Atomic int measurement_active = 0;  // Atomic für Thread-Safety
+static volatile _Atomic int pointcloud_requested = 0;
+static volatile _Atomic int mqtt_connected = 0;
+int debug_enabled = DEFAULT_DEBUG_ENABLED;
 static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;
 static struct mosquitto *mosq = NULL;
 static int http_socket = -1;
@@ -84,17 +110,21 @@ static volatile int mqtt_connected = 0;
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
+    if (!debug_enabled) return;
+    
     static FILE* debug_file = NULL;
-    static int first_call = 1;
+    static const int first_call = 1;
+    
+    pthread_mutex_lock(&debug_mutex);
     
     // Beim ersten Aufruf Debug-File öffnen
     if (first_call) {
-        debug_file = fopen("debug_hps3d.log", "w");
+        debug_file = fopen(DEFAULT_DEBUG_FILE, "w");
         if (!debug_file) {
             fprintf(stderr, "FEHLER: Debug-Datei konnte nicht geöffnet werden\n");
+            pthread_mutex_unlock(&debug_mutex);
             return;
         }
-        first_call = 0;
     }
 
     va_list args;
@@ -109,27 +139,9 @@ void debug_print(const char* format, ...) {
     fflush(debug_file);
     
     va_end(args);
+    
+    pthread_mutex_unlock(&debug_mutex);
 }
-
-// Messpunkt Definition
-typedef struct {
-    int x, y;           // Pixel-Koordinaten im 160x60 Array (Zentrum des 5x5 Bereichs)
-    float distance;     // Gemessene Durchschnittsdistanz in mm
-    float min_distance; // Minimale Distanz im Messbereich
-    float max_distance; // Maximale Distanz im Messbereich
-    int valid_pixels;   // Anzahl gültiger Pixel im Messbereich
-    int valid;          // Messung gültig (mind. 50% der Pixel gültig)
-    time_t timestamp;   // Zeitstempel der letzten Messung
-    char name[32];      // Name des Messpunkts
-} MeasurePoint;
-
-// Globale Messpunkte
-static MeasurePoint points[MAX_POINTS] = {
-    {40, 30, 0.0, 0.0, 0.0, 0, 0, 0, "point_1"},   // Links-Oben
-    {120, 30, 0.0, 0.0, 0.0, 0, 0, 0, "point_2"},  // Rechts-Oben
-    {40, 45, 0.0, 0.0, 0.0, 0, 0, 0, "point_3"},   // Links-Unten
-    {120, 45, 0.0, 0.0, 0.0, 0, 0, 0, "point_4"}   // Rechts-Unten
-};
 
 // Event Callback für HPS3D
 static void EventCallBackFunc(int handle, int eventType, uint8_t *data, int dataLen, void *userPara) {
@@ -141,7 +153,7 @@ static void EventCallBackFunc(int handle, int eventType, uint8_t *data, int data
     switch (event) {
         case HPS3D_DISCONNECT_EVEN:
             printf("WARNUNG: HPS3D-160 getrennt, versuche Wiederverbindung...\n");
-            reconnect_needed = true;
+            // reconnect_needed = true; // This variable is removed
             break;
         case HPS3D_SYS_EXCEPTION_EVEN:
             if (data) {
@@ -226,9 +238,10 @@ int measure_points() {
     if (ret != HPS3D_RET_OK) {
         debug_print("WARNUNG: Messung fehlgeschlagen (Code: %d)\n", ret);
         
-        // Bei Timeout versuchen wir einen Reconnect
-        if (ret == HPS3D_RET_TIMEOUT) {
-            debug_print("Timeout aufgetreten - versuche Reconnect...\n");
+        // Bei schwerwiegenden Fehlern versuchen wir einen Reconnect
+        if (ret == HPS3D_RET_ERROR || ret == HPS3D_RET_CONNECT_FAILED || 
+            ret == HPS3D_RET_READ_ERR || ret == HPS3D_RET_WRITE_ERR) {
+            debug_print("Schwerwiegender Fehler - versuche Reconnect...\n");
             HPS3D_StopCapture(g_handle);
             usleep(100000);  // 100ms Pause vor Reconnect
             
@@ -310,13 +323,13 @@ int measure_points() {
                 points[i].min_distance = min_distance;
                 points[i].max_distance = max_distance;
                 points[i].valid_pixels = valid_count;
-                points[i].valid = 1;
-                points[i].timestamp = time(NULL);
+                points[i].flags.valid = 1; // Update bitfield
+                points[i].timestamp = time(NULL); // Update timestamp
                 
                 debug_print("Messung gültig: %d/%d Pixel (min: %d)\n", 
                           valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
             } else {
-                points[i].valid = 0;
+                points[i].flags.valid = 0; // Update bitfield
                 points[i].valid_pixels = valid_count;
                 
                 debug_print("Messung ungültig: %d/%d Pixel (min: %d)\n", 
@@ -340,7 +353,7 @@ char* create_json_output() {
         "\"active\": %s,"
         "\"measurements\": {",
         time(NULL),
-        measurement_active ? "true" : "false"
+        atomic_load(&measurement_active) ? "true" : "false"
     );
     
     for (int i = 0; i < MAX_POINTS; i++) {
@@ -362,7 +375,7 @@ char* create_json_output() {
             points[i].min_distance,
             points[i].max_distance,
             points[i].valid_pixels,
-            points[i].valid ? "true" : "false",
+            points[i].flags.valid ? "true" : "false",
             time(NULL) - points[i].timestamp,
             points[i].x, points[i].y,
             (i < MAX_POINTS-1) ? "," : ""
@@ -444,7 +457,7 @@ void* output_thread(void* arg) {
     
     while (running) {
         // Normale Messpunkte ausgeben wenn aktiv
-        if (measurement_active) {
+        if (atomic_load(&measurement_active)) {
             char* json_output = create_json_output();
             
             // Ausgabe auf stdout
@@ -452,7 +465,7 @@ void* output_thread(void* arg) {
             fflush(stdout);
             
             // MQTT Publish wenn verbunden
-            if (mosq && mqtt_connected) {
+            if (mosq && atomic_load(&mqtt_connected)) {
                 int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json_output), json_output, 0, false);
                 if (rc != MOSQ_ERR_SUCCESS) {
                     debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
@@ -461,13 +474,13 @@ void* output_thread(void* arg) {
         }
         
         // Punktwolke bei Anforderung senden
-        if (pointcloud_requested) {
+        if (atomic_load(&pointcloud_requested)) {
             debug_print("Pointcloud requested, capturing data...\n");
             
             // Stelle sicher, dass wir aktuelle Daten haben
             if (measure_points() == 0) {
                 char* cloud_json = create_pointcloud_json();
-                if (mosq && mqtt_connected) {
+                if (mosq && atomic_load(&mqtt_connected)) {
                     debug_print("Publishing pointcloud data...\n");
                     int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
                                     strlen(cloud_json), cloud_json, 0, false);
@@ -480,7 +493,7 @@ void* output_thread(void* arg) {
             } else {
                 debug_print("Failed to capture pointcloud data\n");
             }
-            pointcloud_requested = 0;  // Request zurücksetzen
+            atomic_store(&pointcloud_requested, 0);  // Request zurücksetzen
         }
         
         usleep(OUTPUT_INTERVAL_MS * 1000);
@@ -503,10 +516,10 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
     
     if (strcmp(message->topic, MQTT_CONTROL_TOPIC) == 0) {
         if (strncmp(message->payload, "start", message->payloadlen) == 0) {
-            measurement_active = 1;
+            atomic_store(&measurement_active, 1);
             debug_print("Messung aktiviert via MQTT\n");
         } else if (strncmp(message->payload, "stop", message->payloadlen) == 0) {
-            measurement_active = 0;
+            atomic_store(&measurement_active, 0);
             debug_print("Messung deaktiviert via MQTT\n");
         } else if (strncmp(message->payload, "get_pointcloud", message->payloadlen) == 0) {
             debug_print("Punktwolke angefordert via MQTT\n");
@@ -537,7 +550,7 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
             }
             
             // Sende Daten
-            if (mosq && mqtt_connected) {
+            if (mosq && atomic_load(&mqtt_connected)) {
                 int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
                                 strlen(cloud_json), cloud_json, 0, false);
                 if (rc != MOSQ_ERR_SUCCESS) {
@@ -558,7 +571,7 @@ void mqtt_connect_callback(struct mosquitto *mosq, void *userdata, int result) {
     (void)userdata;
     
     if (!result) {
-        mqtt_connected = 1;
+        atomic_store(&mqtt_connected, 1);
         debug_print("MQTT: Verbindung hergestellt\n");
         
         // Resubscribe nach Reconnect
@@ -569,10 +582,10 @@ void mqtt_connect_callback(struct mosquitto *mosq, void *userdata, int result) {
         // Status nach Verbindung senden
         char status[100];
         snprintf(status, sizeof(status), "{\"status\": \"connected\", \"active\": %s}", 
-                measurement_active ? "true" : "false");
+                atomic_load(&measurement_active) ? "true" : "false");
         mosquitto_publish(mosq, NULL, MQTT_TOPIC "/status", strlen(status), status, 0, false);
     } else {
-        mqtt_connected = 0;
+        atomic_store(&mqtt_connected, 0);
         debug_print("MQTT: Verbindung fehlgeschlagen (%d)\n", result);
     }
 }
@@ -582,7 +595,7 @@ void mqtt_disconnect_callback(struct mosquitto *mosq, void *userdata, int rc) {
     (void)mosq;
     (void)userdata;
     
-    mqtt_connected = 0;
+    atomic_store(&mqtt_connected, 0);
     debug_print("MQTT: Verbindung getrennt (%d)\n", rc);
 }
 
@@ -692,18 +705,18 @@ void* http_server_thread(void* arg) {
                 // Status Abfrage
                 snprintf(response, sizeof(response), 
                         "{\"active\": %s, \"connected\": %s}", 
-                        measurement_active ? "true" : "false",
+                        atomic_load(&measurement_active) ? "true" : "false",
                         HPS3D_IsConnect(g_handle) ? "true" : "false");
             }
             else if (strstr(buffer, "POST /start") != NULL) {
                 // Messung starten
-                measurement_active = 1;
+                atomic_store(&measurement_active, 1);
                 snprintf(response, sizeof(response), "{\"status\": \"started\"}");
                 debug_print("Messung aktiviert via HTTP\n");
             }
             else if (strstr(buffer, "POST /stop") != NULL) {
                 // Messung stoppen
-                measurement_active = 0;
+                atomic_store(&measurement_active, 0);
                 snprintf(response, sizeof(response), "{\"status\": \"stopped\"}");
                 debug_print("Messung deaktiviert via HTTP\n");
             }
@@ -731,7 +744,7 @@ void* measure_thread(void* arg) {
     bool was_active = false;  // Merker für Zustandswechsel
     
     while (running) {
-        if (!measurement_active) {
+        if (!atomic_load(&measurement_active)) {
             if (was_active) {
                 debug_print("Messung inaktiv - stoppe und schließe Sensor\n");
                 if (g_handle >= 0) {
@@ -758,20 +771,7 @@ void* measure_thread(void* arg) {
             }
         }
 
-        if (reconnect_needed) {
-            if (g_handle >= 0) {
-                HPS3D_StopCapture(g_handle);
-                HPS3D_CloseDevice(g_handle);
-                g_handle = -1;
-            }
-            sleep(1);  // Kurz warten vor Reconnect
-            if (init_lidar() == 0) {
-                reconnect_needed = false;
-                was_active = true;
-                printf("HPS3D-160 erfolgreich neu verbunden\n");
-            }
-            continue;
-        }
+        // reconnect_needed is removed, so this block is removed
 
         if (measure_points() != 0) {
             usleep(500000); // 500ms Pause bei Fehler
@@ -884,7 +884,7 @@ void cleanup(void) {
     }
     
     if (mosq) {
-        if (mqtt_connected) {
+        if (atomic_load(&mqtt_connected)) {
             mosquitto_disconnect(mosq);
         }
         mosquitto_loop_stop(mosq, true);
