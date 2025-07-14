@@ -492,6 +492,7 @@ void* output_thread(void* arg) {
     while (running) {
         // Normale Messpunkte ausgeben wenn aktiv
         if (atomic_load(&measurement_active)) {
+            debug_print("Erstelle Messdaten-JSON...\n");
             char* json_output = create_json_output();
             
             // Ausgabe auf stdout
@@ -503,29 +504,40 @@ void* output_thread(void* arg) {
                 int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json_output), json_output, 0, false);
                 if (rc != MOSQ_ERR_SUCCESS) {
                     debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
+                } else {
+                    debug_print("Messdaten erfolgreich gesendet\n");
                 }
             }
         }
         
         // Punktwolke bei Anforderung senden
         if (atomic_load(&pointcloud_requested)) {
-            debug_print("Pointcloud requested, capturing data...\n");
+            debug_print("Punktwolke angefordert, erfasse Daten...\n");
+            
+            // Prüfe ob LIDAR verbunden
+            if (!HPS3D_IsConnect(g_handle)) {
+                debug_print("FEHLER: LIDAR nicht verbunden für Punktwolke\n");
+                atomic_store(&pointcloud_requested, 0);
+                continue;
+            }
             
             // Stelle sicher, dass wir aktuelle Daten haben
             if (measure_points() == 0) {
                 char* cloud_json = create_pointcloud_json();
-                if (mosq && atomic_load(&mqtt_connected)) {
-                    debug_print("Publishing pointcloud data...\n");
+                if (cloud_json && mosq && atomic_load(&mqtt_connected)) {
+                    debug_print("Sende Punktwolken-Daten...\n");
                     int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
                                     strlen(cloud_json), cloud_json, 0, false);
                     if (rc != MOSQ_ERR_SUCCESS) {
-                        debug_print("Failed to publish pointcloud: %d\n", rc);
+                        debug_print("FEHLER: Punktwolken-Publish fehlgeschlagen: %d\n", rc);
                     } else {
-                        debug_print("Pointcloud published successfully\n");
+                        debug_print("Punktwolke erfolgreich gesendet\n");
                     }
+                } else {
+                    debug_print("FEHLER: Punktwolken-JSON konnte nicht erstellt werden oder MQTT nicht verbunden\n");
                 }
             } else {
-                debug_print("Failed to capture pointcloud data\n");
+                debug_print("FEHLER: Punktwolken-Messung fehlgeschlagen\n");
             }
             atomic_store(&pointcloud_requested, 0);  // Request zurücksetzen
         }
@@ -550,51 +562,16 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
     
     if (strcmp(message->topic, MQTT_CONTROL_TOPIC) == 0) {
         if (strncmp(message->payload, "start", message->payloadlen) == 0) {
-            atomic_store(&measurement_active, 1);
             debug_print("Messung aktiviert via MQTT\n");
-        } else if (strncmp(message->payload, "stop", message->payloadlen) == 0) {
-            atomic_store(&measurement_active, 0);
+            atomic_store(&measurement_active, 1);
+        } 
+        else if (strncmp(message->payload, "stop", message->payloadlen) == 0) {
             debug_print("Messung deaktiviert via MQTT\n");
-        } else if (strncmp(message->payload, "get_pointcloud", message->payloadlen) == 0) {
+            atomic_store(&measurement_active, 0);
+        }
+        else if (strncmp(message->payload, "get_pointcloud", message->payloadlen) == 0) {
             debug_print("Punktwolke angefordert via MQTT\n");
-            
-            // Prüfe ob LIDAR verbunden
-            if (!HPS3D_IsConnect(g_handle)) {
-                debug_print("FEHLER: LIDAR nicht verbunden\n");
-                return;
-            }
-            
-            // Prüfe ob Messdaten initialisiert
-            if (!g_measureData.full_depth_data.distance) {
-                debug_print("FEHLER: Messdaten nicht initialisiert\n");
-                return;
-            }
-            
-            // Führe Messung durch
-            if (measure_points() != 0) {
-                debug_print("FEHLER: Punktwolken-Messung fehlgeschlagen\n");
-                return;
-            }
-            
-            // Erstelle JSON
-            char* cloud_json = create_pointcloud_json();
-            if (!cloud_json) {
-                debug_print("FEHLER: JSON-Erstellung fehlgeschlagen\n");
-                return;
-            }
-            
-            // Sende Daten
-            if (mosq && atomic_load(&mqtt_connected)) {
-                int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
-                                strlen(cloud_json), cloud_json, 0, false);
-                if (rc != MOSQ_ERR_SUCCESS) {
-                    debug_print("FEHLER: MQTT Publish fehlgeschlagen (%d)\n", rc);
-                } else {
-                    debug_print("Punktwolke erfolgreich gesendet\n");
-                }
-            } else {
-                debug_print("FEHLER: MQTT nicht verbunden\n");
-            }
+            atomic_store(&pointcloud_requested, 1);
         }
     }
 }
