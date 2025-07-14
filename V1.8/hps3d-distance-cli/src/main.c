@@ -193,8 +193,15 @@ static void EventCallBackFunc(int handle, int eventType, uint8_t *data, int data
 
 // Signal Handler
 void signal_handler(int sig) {
-    printf("Signal %d empfangen, beende Service...\n", sig);
-    running = 0;
+    debug_print("Signal %d empfangen, beende Service...\n", sig);
+    running = 0;  // Signal an Threads zum Beenden
+    
+    // Sofort alle Messungen stoppen
+    atomic_store(&measurement_active, 0);
+    atomic_store(&pointcloud_requested, 0);
+    
+    // Warte nicht auf Threads in Signal Handler
+    // Cleanup wird im Hauptprogramm durchgeführt
 }
 
 
@@ -883,18 +890,26 @@ int create_pid_file() {
     return 0;
 }
 
-// Cleanup aktualisiert
+// Cleanup-Funktion überarbeitet
 void cleanup(void) {
     debug_print("Cleanup...\n");
     
-    running = 0;  // Threads stoppen
+    // Threads signalisieren dass sie beenden sollen
+    running = 0;
+    atomic_store(&measurement_active, 0);
+    atomic_store(&pointcloud_requested, 0);
     
+    // LIDAR stoppen und schließen
     if (g_handle >= 0) {
+        debug_print("Stoppe LIDAR...\n");
         HPS3D_StopCapture(g_handle);
         HPS3D_CloseDevice(g_handle);
+        g_handle = -1;
     }
     
+    // MQTT beenden
     if (mosq) {
+        debug_print("Beende MQTT...\n");
         if (atomic_load(&mqtt_connected)) {
             mosquitto_disconnect(mosq);
         }
@@ -903,23 +918,32 @@ void cleanup(void) {
         mosquitto_lib_cleanup();
     }
     
+    // HTTP Server beenden
     if (http_socket >= 0) {
+        debug_print("Schließe HTTP Server...\n");
         close(http_socket);
+        http_socket = -1;
     }
     
+    // SDK aufräumen
+    debug_print("Räume SDK auf...\n");
     HPS3D_MeasureDataFree(&g_measureData);
     HPS3D_UnregisterEventCallback();
     
+    // Debug-Log schließen
     if (debug_file) {
+        debug_print("Schließe Debug-Log...\n");
         fclose(debug_file);
+        debug_file = NULL;
     }
     
+    // PID-File löschen
     unlink(PID_FILE);
     
     debug_print("Service beendet\n");
 }
 
-// Hauptprogramm
+// Hauptprogramm anpassen
 int main(int argc, char *argv[]) {
     // Signal Handler
     signal(SIGINT, signal_handler);
@@ -984,13 +1008,42 @@ int main(int argc, char *argv[]) {
             cleanup();
             return 1;
         }
-        pthread_join(http_tid, NULL);
     }
     
-    // Auf Threads warten
-    pthread_join(measure_tid, NULL);
-    pthread_join(output_tid, NULL);
+    // Warte auf Signal zum Beenden
+    while (running) {
+        usleep(100000);  // 100ms Pause
+    }
     
+    debug_print("Warte auf Beendigung der Threads...\n");
+    
+    // Warte auf Thread-Beendigung mit Timeout
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 5;  // 5 Sekunden Timeout
+    
+    int ret;
+    ret = pthread_timedjoin_np(measure_tid, NULL, &timeout);
+    if (ret != 0) {
+        debug_print("WARNUNG: Mess-Thread reagiert nicht, wird zwangsbeendet\n");
+        pthread_cancel(measure_tid);
+    }
+    
+    ret = pthread_timedjoin_np(output_tid, NULL, &timeout);
+    if (ret != 0) {
+        debug_print("WARNUNG: Output-Thread reagiert nicht, wird zwangsbeendet\n");
+        pthread_cancel(output_tid);
+    }
+    
+    if (http_socket >= 0) {
+        ret = pthread_timedjoin_np(http_tid, NULL, &timeout);
+        if (ret != 0) {
+            debug_print("WARNUNG: HTTP-Thread reagiert nicht, wird zwangsbeendet\n");
+            pthread_cancel(http_tid);
+        }
+    }
+    
+    // Finale Aufräumarbeiten
     cleanup();
     return 0;
 }
