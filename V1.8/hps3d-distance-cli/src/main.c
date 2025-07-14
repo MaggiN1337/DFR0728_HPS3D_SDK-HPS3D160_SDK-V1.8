@@ -1,3 +1,4 @@
+#define _GNU_SOURCE         /* See feature_test_macros(7) */
 /*
  * HPS3D-160 LIDAR 4-Punkt Messservice für NodeRed Integration
  * 
@@ -25,6 +26,8 @@
 #include <netinet/in.h>
 #include <mosquitto.h>
 #include <stdatomic.h> // Required for _Atomic
+#include <sys/types.h>
+#include <signal.h>
 
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
@@ -943,6 +946,43 @@ void cleanup(void) {
     debug_print("Service beendet\n");
 }
 
+// Portable Thread-Join mit Timeout
+static int thread_join_timeout(pthread_t thread, void **retval, const struct timespec *timeout) {
+#ifdef __GLIBC__
+    // GNU/Linux: Verwende pthread_timedjoin_np
+    return pthread_timedjoin_np(thread, retval, timeout);
+#else
+    // Portable Implementierung
+    struct timespec start_time, current_time;
+    clock_gettime(CLOCK_REALTIME, &start_time);
+
+    // Maximale Wartezeit in Mikrosekunden
+    unsigned long max_wait_us = (timeout->tv_sec - start_time.tv_sec) * 1000000 +
+                              (timeout->tv_nsec - start_time.tv_nsec) / 1000;
+
+    // Versuche Thread zu beenden mit periodischen Checks
+    while (1) {
+        // Non-blocking check ob Thread beendet ist
+        int ret = pthread_kill(thread, 0);
+        if (ret == ESRCH) {
+            // Thread existiert nicht mehr, versuche join
+            return pthread_join(thread, retval);
+        }
+
+        // Prüfe Timeout
+        clock_gettime(CLOCK_REALTIME, &current_time);
+        if (current_time.tv_sec > timeout->tv_sec ||
+            (current_time.tv_sec == timeout->tv_sec && 
+             current_time.tv_nsec >= timeout->tv_nsec)) {
+            return ETIMEDOUT;
+        }
+
+        // Kurze Pause
+        usleep(10000);  // 10ms
+    }
+}
+#endif
+
 // Hauptprogramm anpassen
 int main(int argc, char *argv[]) {
     // Signal Handler
@@ -1023,20 +1063,20 @@ int main(int argc, char *argv[]) {
     timeout.tv_sec += 5;  // 5 Sekunden Timeout
     
     int ret;
-    ret = pthread_timedjoin_np(measure_tid, NULL, &timeout);
+    ret = thread_join_timeout(measure_tid, NULL, &timeout);
     if (ret != 0) {
         debug_print("WARNUNG: Mess-Thread reagiert nicht, wird zwangsbeendet\n");
         pthread_cancel(measure_tid);
     }
     
-    ret = pthread_timedjoin_np(output_tid, NULL, &timeout);
+    ret = thread_join_timeout(output_tid, NULL, &timeout);
     if (ret != 0) {
         debug_print("WARNUNG: Output-Thread reagiert nicht, wird zwangsbeendet\n");
         pthread_cancel(output_tid);
     }
     
     if (http_socket >= 0) {
-        ret = pthread_timedjoin_np(http_tid, NULL, &timeout);
+        ret = thread_join_timeout(http_tid, NULL, &timeout);
         if (ret != 0) {
             debug_print("WARNUNG: HTTP-Thread reagiert nicht, wird zwangsbeendet\n");
             pthread_cancel(http_tid);
