@@ -35,8 +35,8 @@ static int init_http_server(void);
 static int measure_points(void);
 static char* create_json_output(void);
 static void cleanup(void);
-static int load_config(void);
 static int create_pid_file(void);
+static int load_config(void);
 
 void* measure_thread(void* arg);
 void* output_thread(void* arg);
@@ -162,78 +162,6 @@ void signal_handler(int sig) {
     running = 0;
 }
 
-// Konfigurationsdatei laden
-int load_config() {
-    FILE *fp = fopen(CONFIG_FILE, "r");
-    if (!fp) {
-        printf("Verwende Standard-Konfiguration\n");
-        return 0;
-    }
-    
-    char line[256];
-    int point_idx = 0;
-    char debug_file_path[256] = DEFAULT_DEBUG_FILE;
-    
-    while (fgets(line, sizeof(line), fp)) {
-        // Kommentare und leere Zeilen überspringen
-        if (line[0] == '#' || line[0] == '\n') continue;
-        
-        // Debug-Einstellungen verarbeiten
-        if (strncmp(line, "debug=", 6) == 0) {
-            debug_enabled = atoi(line + 6);
-            continue;
-        }
-        
-        if (strncmp(line, "debug_file=", 11) == 0) {
-            char* path = line + 11;
-            // Newline am Ende entfernen
-            char* nl = strchr(path, '\n');
-            if (nl) *nl = '\0';
-            // Wenn ein Pfad angegeben ist, diesen verwenden
-            if (strlen(path) > 0) {
-                strncpy(debug_file_path, path, sizeof(debug_file_path)-1);
-            }
-            continue;
-        }
-
-        // Minimale gültige Pixel-Einstellung verarbeiten
-        if (strncmp(line, "min_valid_pixels=", 17) == 0) {
-            min_valid_pixels = atoi(line + 17);
-            continue;
-        }
-        
-        // Messpunkte verarbeiten
-        int x, y;
-        char name[32];
-        if (point_idx < MAX_POINTS && sscanf(line, "%d,%d,%s", &x, &y, name) == 3) {
-            if (x >= AREA_OFFSET && x < (160 - AREA_OFFSET) && 
-                y >= AREA_OFFSET && y < (60 - AREA_OFFSET)) {
-                points[point_idx].x = x;
-                points[point_idx].y = y;
-                strncpy(points[point_idx].name, name, sizeof(points[point_idx].name)-1);
-                point_idx++;
-            } else {
-                printf("WARNUNG: Koordinaten (%d,%d) ungültig - 5x5 Bereich außerhalb des Sensors\n", x, y);
-            }
-        }
-    }
-    
-    fclose(fp);
-    
-    // Debug-Datei öffnen wenn aktiviert
-    if (debug_enabled) {
-        debug_file = fopen(debug_file_path, "w");
-        if (!debug_file) {
-            printf("WARNUNG: Debug-Datei %s konnte nicht geöffnet werden\n", debug_file_path);
-        } else {
-            printf("Debug-Ausgaben werden in %s geschrieben\n", debug_file_path);
-        }
-    }
-    
-    printf("Konfiguration geladen: %d Punkte, Debug %s, min_valid_pixels %d\n", 
-           point_idx, debug_enabled ? "aktiviert" : "deaktiviert", min_valid_pixels);
-    return point_idx;
-}
 
 // LIDAR initialisieren
 int init_lidar() {
@@ -838,6 +766,79 @@ void* measure_thread(void* arg) {
     return NULL;
 }
 
+// Konfigurationsdatei laden
+int load_config() {
+    FILE *fp = fopen(CONFIG_FILE, "r");
+    if (!fp) {
+        printf("Verwende Standard-Konfiguration\n");
+        return 0;
+    }
+    
+    char line[256];
+    int point_idx = 0;
+    char debug_file_path[256] = DEFAULT_DEBUG_FILE;
+    
+    while (fgets(line, sizeof(line), fp)) {
+        // Kommentare und leere Zeilen überspringen
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        // Debug-Einstellungen verarbeiten
+        if (strncmp(line, "debug=", 6) == 0) {
+            debug_enabled = atoi(line + 6);
+            continue;
+        }
+        
+        if (strncmp(line, "debug_file=", 11) == 0) {
+            char* path = line + 11;
+            // Newline am Ende entfernen
+            char* nl = strchr(path, '\n');
+            if (nl) *nl = '\0';
+            // Wenn ein Pfad angegeben ist, diesen verwenden
+            if (strlen(path) > 0) {
+                strncpy(debug_file_path, path, sizeof(debug_file_path)-1);
+            }
+            continue;
+        }
+
+        // Minimale gültige Pixel-Einstellung verarbeiten
+        if (strncmp(line, "min_valid_pixels=", 17) == 0) {
+            min_valid_pixels = atoi(line + 17);
+            continue;
+        }
+        
+        // Messpunkte verarbeiten
+        int x, y;
+        char name[32];
+        if (point_idx < MAX_POINTS && sscanf(line, "%d,%d,%s", &x, &y, name) == 3) {
+            if (x >= AREA_OFFSET && x < (160 - AREA_OFFSET) && 
+                y >= AREA_OFFSET && y < (60 - AREA_OFFSET)) {
+                points[point_idx].x = x;
+                points[point_idx].y = y;
+                strncpy(points[point_idx].name, name, sizeof(points[point_idx].name)-1);
+                point_idx++;
+            } else {
+                printf("WARNUNG: Koordinaten (%d,%d) ungültig - 5x5 Bereich außerhalb des Sensors\n", x, y);
+            }
+        }
+    }
+    
+    fclose(fp);
+    
+    // Debug-Datei öffnen wenn aktiviert
+    if (debug_enabled) {
+        debug_file = fopen(debug_file_path, "w");
+        if (!debug_file) {
+            printf("WARNUNG: Debug-Datei %s konnte nicht geöffnet werden\n", debug_file_path);
+        } else {
+            printf("Debug-Ausgaben werden in %s geschrieben\n", debug_file_path);
+        }
+    }
+    
+    printf("Konfiguration geladen: %d Punkte, Debug %s, min_valid_pixels %d\n", 
+           point_idx, debug_enabled ? "aktiviert" : "deaktiviert", min_valid_pixels);
+    return point_idx;
+}
+
 // PID-Datei erstellen
 int create_pid_file() {
     FILE *fp = fopen(PID_FILE, "w");
@@ -899,6 +900,12 @@ int main(int argc, char *argv[]) {
     // Daemon Mode
     if (argc > 1 && strcmp(argv[1], "-d") == 0) {
         daemon(0, 0);
+    }
+    
+    // Konfiguration laden
+    if (load_config() < 0) {
+        debug_print("FEHLER: Konfiguration konnte nicht geladen werden\n");
+        return 1;
     }
     
     // PID-Datei erstellen
