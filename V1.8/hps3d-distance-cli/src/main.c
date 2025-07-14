@@ -784,18 +784,46 @@ void* http_server_thread(void* arg) {
 // Mess-Thread
 void* measure_thread(void* arg) {
     (void)arg;  // Ungenutzte Parameter markieren
+    bool was_active = false;  // Merker für Zustandswechsel
     
     while (running) {
         if (!measurement_active) {
+            if (was_active) {
+                debug_print("Messung inaktiv - stoppe und schließe Sensor\n");
+                if (g_handle >= 0) {
+                    HPS3D_StopCapture(g_handle);
+                    HPS3D_CloseDevice(g_handle);
+                    g_handle = -1;
+                }
+                was_active = false;
+            }
             usleep(100000);  // 100ms Pause wenn inaktiv
             continue;
         }
 
+        // Sensor bei Aktivierung neu initialisieren
+        if (!was_active) {
+            debug_print("Messung aktiviert - initialisiere Sensor\n");
+            if (init_lidar() == 0) {
+                was_active = true;
+                debug_print("Sensor erfolgreich initialisiert\n");
+            } else {
+                debug_print("FEHLER: Sensor konnte nicht initialisiert werden\n");
+                usleep(1000000);  // 1s Pause vor erneutem Versuch
+                continue;
+            }
+        }
+
         if (reconnect_needed) {
-            HPS3D_CloseDevice(g_handle);
+            if (g_handle >= 0) {
+                HPS3D_StopCapture(g_handle);
+                HPS3D_CloseDevice(g_handle);
+                g_handle = -1;
+            }
             sleep(1);  // Kurz warten vor Reconnect
             if (init_lidar() == 0) {
                 reconnect_needed = false;
+                was_active = true;
                 printf("HPS3D-160 erfolgreich neu verbunden\n");
             }
             continue;
