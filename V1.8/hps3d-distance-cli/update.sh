@@ -25,10 +25,35 @@ sudo make install
 echo "Prüfe Konfigurationsverzeichnis..."
 sudo mkdir -p /etc/hps3d
 
-# Beispielkonfiguration kopieren falls nicht vorhanden
-if [ ! -f /etc/hps3d/points.conf ]; then
+# Konfigurationsdatei überprüfen und aktualisieren
+CONFIG_FILE="/etc/hps3d/points.conf"
+EXAMPLE_CONFIG="points.conf.example"
+if [ -f "$CONFIG_FILE" ]; then
+    # MD5 Checksummen vergleichen
+    CONFIG_MD5=$(md5sum "$CONFIG_FILE" | cut -d' ' -f1)
+    EXAMPLE_MD5=$(md5sum "$EXAMPLE_CONFIG" | cut -d' ' -f1)
+    
+    if [ "$CONFIG_MD5" != "$EXAMPLE_MD5" ]; then
+        echo "WARNUNG: Konfigurationsdatei unterscheidet sich von der Beispielkonfiguration"
+        echo "         Dies könnte auf neue Optionen oder Änderungen hinweisen"
+        echo "         Ihre aktuelle Konfiguration wird gesichert"
+        
+        # Backup mit Zeitstempel erstellen
+        BACKUP_FILE="${CONFIG_FILE}.$(date +%Y%m%d_%H%M%S).bak"
+        sudo cp "$CONFIG_FILE" "$BACKUP_FILE"
+        echo "         Backup erstellt: $BACKUP_FILE"
+        
+        # Neue Konfiguration kopieren
+        echo "         Aktualisiere Konfiguration mit neuer Version..."
+        sudo cp "$EXAMPLE_CONFIG" "$CONFIG_FILE"
+        echo "         Bitte überprüfen Sie die neue Konfiguration und passen Sie sie bei Bedarf an"
+        echo "         Ihre alte Konfiguration wurde als Backup gespeichert"
+    else
+        echo "Konfigurationsdatei ist aktuell"
+    fi
+else
     echo "Kopiere Beispielkonfiguration..."
-    sudo cp points.conf.example /etc/hps3d/points.conf
+    sudo cp "$EXAMPLE_CONFIG" "$CONFIG_FILE"
 fi
 
 # Service neustarten

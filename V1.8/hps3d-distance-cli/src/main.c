@@ -48,11 +48,11 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define AREA_SIZE 5        // 5x5 Pixel Messbereich
 #define AREA_OFFSET 2      // (5-1)/2 für zentrierten Bereich
 #define DEFAULT_MIN_VALID_PIXELS 6  // Standard: 25% der Pixel (6 von 25)
-#define MEASURE_INTERVAL_MS 500  // 50 Hz Messrate
-#define OUTPUT_INTERVAL_MS 1000  // 1 Hz Output für NodeRed
+#define MEASURE_INTERVAL_MS 1000  // Reduziert auf 1 Hz für stabilere Messungen
+#define OUTPUT_INTERVAL_MS 2000  // Output alle 2 Sekunden
 #define CONFIG_FILE "/etc/hps3d/points.conf"
 #define PID_FILE "/var/run/hps3d_service.pid"
-#define DEFAULT_DEBUG_FILE "debug_hps3d.log"
+#define DEFAULT_DEBUG_FILE "/var/log/hps3d/debug.log"
 #define USB_PORT "/dev/ttyACM0"
 
 // HTTP Server Konfiguration
@@ -216,6 +216,7 @@ int init_lidar() {
 // Einzelne Messung durchführen
 int measure_points() {
     if (!HPS3D_IsConnect(g_handle)) {
+        debug_print("FEHLER: LIDAR nicht verbunden\n");
         return -1;
     }
 
@@ -223,7 +224,22 @@ int measure_points() {
     HPS3D_StatusTypeDef ret = HPS3D_SingleCapture(g_handle, &event_type, &g_measureData);
     
     if (ret != HPS3D_RET_OK) {
-        printf("WARNUNG: Messung fehlgeschlagen (%d)\n", ret);
+        debug_print("WARNUNG: Messung fehlgeschlagen (Code: %d)\n", ret);
+        
+        // Bei Timeout versuchen wir einen Reconnect
+        if (ret == HPS3D_RET_TIMEOUT) {
+            debug_print("Timeout aufgetreten - versuche Reconnect...\n");
+            HPS3D_StopCapture(g_handle);
+            usleep(100000);  // 100ms Pause vor Reconnect
+            
+            ret = HPS3D_StartCapture(g_handle);
+            if (ret != HPS3D_RET_OK) {
+                debug_print("FEHLER: Reconnect fehlgeschlagen\n");
+                return -1;
+            }
+            debug_print("Reconnect erfolgreich\n");
+            return 0;  // Nächsten Messzyklus abwarten
+        }
         return -1;
     }
 
@@ -768,9 +784,12 @@ void* measure_thread(void* arg) {
 
 // Konfigurationsdatei laden
 int load_config() {
+    // Debug standardmäßig aktivieren
+    debug_enabled = DEFAULT_DEBUG_ENABLED;
+    
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
-        printf("Verwende Standard-Konfiguration\n");
+        debug_print("Verwende Standard-Konfiguration (Debug aktiviert)\n");
         return 0;
     }
     
@@ -785,6 +804,7 @@ int load_config() {
         // Debug-Einstellungen verarbeiten
         if (strncmp(line, "debug=", 6) == 0) {
             debug_enabled = atoi(line + 6);
+            debug_print("Debug-Modus: %s\n", debug_enabled ? "aktiviert" : "deaktiviert");
             continue;
         }
         
