@@ -84,13 +84,31 @@ static volatile int pointcloud_requested = 0;  // Neue Variable für Punktwolken
 
 // Debug-Ausgabe Funktion
 void debug_print(const char* format, ...) {
-    if (debug_enabled && debug_file) {
-        va_list args;
-        va_start(args, format);
-        vfprintf(debug_file, format, args);
-        fflush(debug_file);  // Sofort in Datei schreiben
-        va_end(args);
+    static FILE* debug_file = NULL;
+    static int first_call = 1;
+    
+    // Beim ersten Aufruf Debug-File öffnen
+    if (first_call) {
+        debug_file = fopen("debug_hps3d.log", "w");
+        if (!debug_file) {
+            fprintf(stderr, "FEHLER: Debug-Datei konnte nicht geöffnet werden\n");
+            return;
+        }
+        first_call = 0;
     }
+
+    va_list args;
+    va_start(args, format);
+    
+    // In Debug-Datei schreiben
+    time_t now = time(NULL);
+    char timestamp[26];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(debug_file, "[%s] ", timestamp);
+    vfprintf(debug_file, format, args);
+    fflush(debug_file);
+    
+    va_end(args);
 }
 
 // Messpunkt Definition
@@ -412,25 +430,31 @@ char* create_json_output() {
 
 // JSON String für Punktwolke erstellen
 char* create_pointcloud_json() {
-    static char json_buffer[160*60*10];  // Genug Platz für alle Pixel
+    static char json_buffer[160*60*50];  // Mehr Speicher für JSON
+    int buffer_pos = 0;
+    int remaining = sizeof(json_buffer);
+    
     pthread_mutex_lock(&data_mutex);
     
-    debug_print("Creating pointcloud JSON...\n");
+    debug_print("Erstelle Punktwolken-JSON...\n");
     
-    snprintf(json_buffer, sizeof(json_buffer),
-        "{"
-        "\"timestamp\": %ld,"
-        "\"width\": %d,"
-        "\"height\": %d,"
-        "\"data\": [",
-        time(NULL),
-        160, 60
-    );
+    // Prüfe Messdaten
+    if (!g_measureData.full_depth_data.distance) {
+        debug_print("FEHLER: Keine Messdaten verfügbar\n");
+        pthread_mutex_unlock(&data_mutex);
+        return NULL;
+    }
+    
+    // Header schreiben
+    buffer_pos += snprintf(json_buffer + buffer_pos, remaining,
+        "{\"timestamp\":%ld,\"width\":%d,\"height\":%d,\"data\":[",
+        time(NULL), 160, 60);
+    remaining = sizeof(json_buffer) - buffer_pos;
     
     int valid_points = 0;
     // Alle Pixel durchgehen
-    for (int y = 0; y < 60; y++) {
-        for (int x = 0; x < 160; x++) {
+    for (int y = 0; y < 60 && remaining > 0; y++) {
+        for (int x = 0; x < 160 && remaining > 0; x++) {
             int pixel_index = y * 160 + x;
             uint16_t distance = g_measureData.full_depth_data.distance[pixel_index];
             
@@ -441,22 +465,28 @@ char* create_pointcloud_json() {
                 distance != HPS3D_ADC_OVERFLOW && 
                 distance != HPS3D_INVALID_DATA) {
                 
-                char point_json[64];
-                snprintf(point_json, sizeof(point_json),
-                    "%s{\"x\":%d,\"y\":%d,\"d\":%d}",
-                    (valid_points > 0 ? "," : ""),  // Komma außer beim ersten Element
-                    x, y, distance
-                );
-                strcat(json_buffer, point_json);
+                // Komma hinzufügen wenn nicht erster Punkt
+                if (valid_points > 0) {
+                    buffer_pos += snprintf(json_buffer + buffer_pos, remaining, ",");
+                    remaining = sizeof(json_buffer) - buffer_pos;
+                }
+                
+                // Punkt hinzufügen
+                buffer_pos += snprintf(json_buffer + buffer_pos, remaining,
+                    "{\"x\":%d,\"y\":%d,\"d\":%d}",
+                    x, y, distance);
+                remaining = sizeof(json_buffer) - buffer_pos;
                 valid_points++;
             }
         }
     }
     
-    strcat(json_buffer, "]}");
-    pthread_mutex_unlock(&data_mutex);
+    // JSON abschließen
+    buffer_pos += snprintf(json_buffer + buffer_pos, remaining, "]}");
     
-    debug_print("Pointcloud JSON created with %d valid points\n", valid_points);
+    debug_print("Punktwolken-JSON erstellt mit %d gültigen Punkten\n", valid_points);
+    
+    pthread_mutex_unlock(&data_mutex);
     return json_buffer;
 }
 
@@ -512,8 +542,16 @@ void* output_thread(void* arg) {
 
 // MQTT Callback für Control Messages
 void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message) {
-    (void)mosq;      // Ungenutzte Parameter markieren
+    (void)mosq;
     (void)userdata;
+    
+    if (!message || !message->payload) {
+        debug_print("MQTT: Ungültige Nachricht empfangen\n");
+        return;
+    }
+    
+    debug_print("MQTT Nachricht empfangen: Topic=%s, Payload=%.*s\n", 
+                message->topic, (int)message->payloadlen, (char*)message->payload);
     
     if (strcmp(message->topic, MQTT_CONTROL_TOPIC) == 0) {
         if (strncmp(message->payload, "start", message->payloadlen) == 0) {
@@ -523,8 +561,45 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
             measurement_active = 0;
             debug_print("Messung deaktiviert via MQTT\n");
         } else if (strncmp(message->payload, "get_pointcloud", message->payloadlen) == 0) {
-            pointcloud_requested = 1;
             debug_print("Punktwolke angefordert via MQTT\n");
+            
+            // Prüfe ob LIDAR verbunden
+            if (!HPS3D_IsConnect(g_handle)) {
+                debug_print("FEHLER: LIDAR nicht verbunden\n");
+                return;
+            }
+            
+            // Prüfe ob Messdaten initialisiert
+            if (!g_measureData.full_depth_data.distance) {
+                debug_print("FEHLER: Messdaten nicht initialisiert\n");
+                return;
+            }
+            
+            // Führe Messung durch
+            if (measure_points() != 0) {
+                debug_print("FEHLER: Punktwolken-Messung fehlgeschlagen\n");
+                return;
+            }
+            
+            // Erstelle JSON
+            char* cloud_json = create_pointcloud_json();
+            if (!cloud_json) {
+                debug_print("FEHLER: JSON-Erstellung fehlgeschlagen\n");
+                return;
+            }
+            
+            // Sende Daten
+            if (mosq && mqtt_connected) {
+                int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
+                                strlen(cloud_json), cloud_json, 0, false);
+                if (rc != MOSQ_ERR_SUCCESS) {
+                    debug_print("FEHLER: MQTT Publish fehlgeschlagen (%d)\n", rc);
+                } else {
+                    debug_print("Punktwolke erfolgreich gesendet\n");
+                }
+            } else {
+                debug_print("FEHLER: MQTT nicht verbunden\n");
+            }
         }
     }
 }
