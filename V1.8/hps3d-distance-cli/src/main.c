@@ -408,6 +408,51 @@ char* create_json_output() {
     return json_buffer;
 }
 
+// JSON String für Punktwolke erstellen
+char* create_pointcloud_json() {
+    static char json_buffer[160*60*10];  // Genug Platz für alle Pixel
+    pthread_mutex_lock(&data_mutex);
+    
+    snprintf(json_buffer, sizeof(json_buffer),
+        "{"
+        "\"timestamp\": %ld,"
+        "\"width\": %d,"
+        "\"height\": %d,"
+        "\"data\": [",
+        time(NULL),
+        160, 60
+    );
+    
+    // Alle Pixel durchgehen
+    for (int y = 0; y < 60; y++) {
+        for (int x = 0; x < 160; x++) {
+            int pixel_index = y * 160 + x;
+            uint16_t distance = g_measureData.full_depth_data.distance[pixel_index];
+            
+            // Nur gültige Werte senden
+            if (distance > 0 && distance < 65000 && 
+                distance != HPS3D_LOW_AMPLITUDE && 
+                distance != HPS3D_SATURATION && 
+                distance != HPS3D_ADC_OVERFLOW && 
+                distance != HPS3D_INVALID_DATA) {
+                
+                char point_json[64];
+                snprintf(point_json, sizeof(point_json),
+                    "%s{\"x\":%d,\"y\":%d,\"d\":%d}",
+                    (pixel_index > 0 ? "," : ""),  // Komma außer beim ersten Element
+                    x, y, distance
+                );
+                strcat(json_buffer, point_json);
+            }
+        }
+    }
+    
+    strcat(json_buffer, "]}");
+    pthread_mutex_unlock(&data_mutex);
+    
+    return json_buffer;
+}
+
 // Output-Thread
 void* output_thread(void* arg) {
     (void)arg;  // Ungenutzte Parameter markieren
@@ -425,6 +470,18 @@ void* output_thread(void* arg) {
             if (rc != MOSQ_ERR_SUCCESS) {
                 debug_print("MQTT Publish fehlgeschlagen: %d\n", rc);
             }
+        }
+        
+        // Punktwolke alle 2 Sekunden senden
+        static time_t last_cloud_time = 0;
+        time_t now = time(NULL);
+        if (now - last_cloud_time >= 2) {
+            char* cloud_json = create_pointcloud_json();
+            if (mosq && mqtt_connected) {
+                mosquitto_publish(mosq, NULL, MQTT_TOPIC "/pointcloud", 
+                                strlen(cloud_json), cloud_json, 0, false);
+            }
+            last_cloud_time = now;
         }
         
         usleep(OUTPUT_INTERVAL_MS * 1000);
