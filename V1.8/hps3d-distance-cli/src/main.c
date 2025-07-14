@@ -47,7 +47,7 @@ void* http_server_thread(void* arg);
 
 // HTTP Server Konfiguration
 #define HTTP_PORT 8080
-#define HTTP_RESPONSE "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: application/json\r\n\r\n%s"
+#define HTTP_RESPONSE "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nContent-Type: application/json\r\n\r\n%s"
 
 // MQTT Konfiguration
 #define MQTT_HOST "localhost"
@@ -400,6 +400,8 @@ char* create_json_output() {
 
 // Output-Thread
 void* output_thread(void* arg) {
+    (void)arg;  // Ungenutzte Parameter markieren
+    
     while (running) {
         char* json_output = create_json_output();
         
@@ -422,6 +424,9 @@ void* output_thread(void* arg) {
 
 // MQTT Callback für Control Messages
 void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message) {
+    (void)mosq;      // Ungenutzte Parameter markieren
+    (void)userdata;
+    
     if (strcmp(message->topic, MQTT_CONTROL_TOPIC) == 0) {
         if (strncmp(message->payload, "start", message->payloadlen) == 0) {
             measurement_active = 1;
@@ -501,6 +506,7 @@ int init_http_server() {
 
 // HTTP Request Handler
 void* http_server_thread(void* arg) {
+    (void)arg;  // Ungenutzte Parameter markieren
     char buffer[1024];
     char response[1024];
     
@@ -550,6 +556,35 @@ void* http_server_thread(void* arg) {
         close(client_socket);
     }
     
+    return NULL;
+}
+
+// Mess-Thread
+void* measure_thread(void* arg) {
+    (void)arg;  // Ungenutzte Parameter markieren
+    
+    while (running) {
+        if (!measurement_active) {
+            usleep(100000);  // 100ms Pause wenn inaktiv
+            continue;
+        }
+
+        if (reconnect_needed) {
+            HPS3D_CloseDevice(g_handle);
+            sleep(1);  // Kurz warten vor Reconnect
+            if (init_lidar() == 0) {
+                reconnect_needed = false;
+                printf("HPS3D-160 erfolgreich neu verbunden\n");
+            }
+            continue;
+        }
+
+        if (measure_points() != 0) {
+            usleep(500000); // 500ms Pause bei Fehler
+        } else {
+            usleep(MEASURE_INTERVAL_MS * 1000);
+        }
+    }
     return NULL;
 }
 
