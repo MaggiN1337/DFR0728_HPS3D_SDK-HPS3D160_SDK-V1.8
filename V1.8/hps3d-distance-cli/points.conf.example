@@ -1,0 +1,11 @@
+# HPS3D-160 Messpunkt Konfiguration
+# Format: x,y,name
+# x: 0-159 (horizontale Position)
+# y: 0-59 (vertikale Position)
+# name: Bezeichnung des Messpunkts
+
+# Standard-Konfiguration
+40,30,point_1   # Links-Oben
+120,30,point_2  # Rechts-Oben
+40,45,point_3   # Links-Unten
+120,45,point_4  # Rechts-Unten 

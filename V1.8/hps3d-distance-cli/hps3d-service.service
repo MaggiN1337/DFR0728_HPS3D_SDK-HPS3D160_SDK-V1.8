@@ -1,0 +1,14 @@
+[Unit]
+Description=HPS3D-160 LIDAR Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hps3d_service -d
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target 
