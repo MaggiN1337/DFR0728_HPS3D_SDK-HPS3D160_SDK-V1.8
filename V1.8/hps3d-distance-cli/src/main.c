@@ -77,7 +77,7 @@ static int debug_enabled = 0;
 static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;
 static struct mosquitto *mosq = NULL;
 static int http_socket = -1;
-static volatile int measurement_active = 1;
+static volatile int measurement_active = 0;  // Start deaktiviert
 static volatile int mqtt_connected = 0;
 
 // Debug-Ausgabe Funktion
@@ -461,6 +461,12 @@ void mqtt_connect_callback(struct mosquitto *mosq, void *userdata, int result) {
         if (mosquitto_subscribe(mosq, NULL, MQTT_CONTROL_TOPIC, 0) != MOSQ_ERR_SUCCESS) {
             debug_print("MQTT: Subscribe nach Reconnect fehlgeschlagen\n");
         }
+        
+        // Status nach Verbindung senden
+        char status[100];
+        snprintf(status, sizeof(status), "{\"status\": \"connected\", \"active\": %s}", 
+                measurement_active ? "true" : "false");
+        mosquitto_publish(mosq, NULL, MQTT_TOPIC "/status", strlen(status), status, 0, false);
     } else {
         mqtt_connected = 0;
         debug_print("MQTT: Verbindung fehlgeschlagen (%d)\n", result);
@@ -679,7 +685,7 @@ void cleanup(void) {
 
 // Hauptprogramm
 int main(int argc, char *argv[]) {
-    printf("HPS3D-160 LIDAR Service gestartet\n");
+    printf("HPS3D-160 LIDAR Service gestartet (Messung initial deaktiviert)\n");
     
     // Signal Handler
     signal(SIGINT, signal_handler);
@@ -705,11 +711,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // LIDAR initialisieren
+    // LIDAR initialisieren aber noch nicht messen
     if (init_lidar() != 0) {
         cleanup();
         return 1;
     }
+    
+    debug_print("Service gestartet, warte auf Aktivierung via MQTT/HTTP...\n");
     
     // Threads starten
     pthread_t measure_tid, output_tid, http_tid;

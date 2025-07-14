@@ -1,0 +1,22 @@
+[Unit]
+Description=HPS3D-160 LIDAR Service
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hps3d_service
+Restart=always
+RestartSec=10
+User=root
+Group=root
+
+# Verzeichnisse erstellen
+ExecStartPre=/bin/mkdir -p /etc/hps3d
+ExecStartPre=/bin/mkdir -p /var/log/hps3d
+
+# Berechtigungen für USB-Gerät
+ExecStartPre=/bin/sh -c 'chmod 666 /dev/ttyACM0 || true'
+
+[Install]
+WantedBy=multi-user.target 
