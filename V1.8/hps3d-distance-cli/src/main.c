@@ -144,10 +144,13 @@ int init_lidar() {
 
     printf("HPS3D-160 verbunden: %s\n", HPS3D_GetDeviceVersion(g_handle));
 
-    // Filter konfigurieren für bessere Messergebnisse
-    HPS3D_SetDistanceFilterConf(g_handle, true, 0.1f);  // Distanzfilter mit K=0.1
-    HPS3D_SetSmoothFilterConf(g_handle, HPS3D_SMOOTH_FILTER_AVERAGE, 2);  // Durchschnittsfilter
-    HPS3D_SetEdgeFilterEnable(g_handle, true);  // Kantenfilter aktivieren
+    // Weniger aggressive Filtereinstellungen
+    HPS3D_SetDistanceFilterConf(g_handle, false, 0.1f);  // Distanzfilter deaktiviert
+    HPS3D_SetSmoothFilterConf(g_handle, HPS3D_SMOOTH_FILTER_DISABLE, 0);  // Glättungsfilter deaktiviert
+    HPS3D_SetEdgeFilterEnable(g_handle, false);  // Kantenfilter deaktiviert
+    
+    // Optische Wegkorrektur aktivieren für genauere Messungen
+    HPS3D_SetOpticalPathCalibration(g_handle, true);
 
     // Messung starten
     ret = HPS3D_StartCapture(g_handle);
@@ -186,6 +189,10 @@ int measure_points() {
             float min_distance = 65000;
             float max_distance = 0;
             
+            // Debug: Array für Rohdaten
+            uint16_t raw_values[AREA_SIZE * AREA_SIZE];
+            int raw_idx = 0;
+            
             // 5x5 Bereich um den Punkt messen
             for (int dy = -AREA_OFFSET; dy <= AREA_OFFSET; dy++) {
                 for (int dx = -AREA_OFFSET; dx <= AREA_OFFSET; dx++) {
@@ -194,21 +201,37 @@ int measure_points() {
                     int pixel_index = y * 160 + x;
                     
                     uint16_t distance_raw = g_measureData.full_depth_data.distance[pixel_index];
+                    raw_values[raw_idx++] = distance_raw;
                     
-                    // Gültige Messwerte verarbeiten (0-65000)
-                    if (distance_raw > 0 && distance_raw < 65000) {
+                    // Erweiterte Gültigkeitsprüfung
+                    if (distance_raw > 0 && distance_raw < 65000 && 
+                        distance_raw != HPS3D_LOW_AMPLITUDE && 
+                        distance_raw != HPS3D_SATURATION && 
+                        distance_raw != HPS3D_ADC_OVERFLOW && 
+                        distance_raw != HPS3D_INVALID_DATA) {
+                        
                         sum_distance += distance_raw;
                         valid_count++;
                         
-                        // Min/Max aktualisieren
                         if (distance_raw < min_distance) min_distance = distance_raw;
                         if (distance_raw > max_distance) max_distance = distance_raw;
                     }
                 }
             }
             
-            // Messung ist gültig wenn mindestens 50% der Pixel gültig sind
-            int required_valid_pixels = (AREA_SIZE * AREA_SIZE) / 2;
+            // Debug: Ausgabe der Rohdaten für jeden Punkt
+            printf("DEBUG Point %s Raw Values:\n", points[i].name);
+            for (int y = 0; y < AREA_SIZE; y++) {
+                printf("  ");
+                for (int x = 0; x < AREA_SIZE; x++) {
+                    printf("%5d ", raw_values[y * AREA_SIZE + x]);
+                }
+                printf("\n");
+            }
+            printf("Valid pixels: %d/%d\n", valid_count, AREA_SIZE * AREA_SIZE);
+            
+            // Messung ist gültig wenn mindestens 25% der Pixel gültig sind (weniger streng)
+            int required_valid_pixels = (AREA_SIZE * AREA_SIZE) / 4;
             if (valid_count >= required_valid_pixels) {
                 points[i].distance = sum_distance / valid_count;
                 points[i].min_distance = min_distance;
