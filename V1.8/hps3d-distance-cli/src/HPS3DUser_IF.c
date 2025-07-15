@@ -217,10 +217,10 @@ int HPS3D_ConvertToMeasureData(__IN uint8_t *data, __OUT HPS3D_MeasureData_t *re
 			resultData->full_roi_data[i].frame_cnt += data[len++] << 8;
 			resultData->full_roi_data[i].frame_cnt += data[len++];
 
-
-			int pixNum = resultData->full_roi_data[i].pixel_number;
+			// Remove unused variable pixNum
 			int j = 0;
-			for (j = 0; j < resultData->full_roi_data[i].pixel_number; j++)
+			// Fix signedness comparison by casting to uint32_t
+			for (j = 0; j < (int)resultData->full_roi_data[i].pixel_number; j++)
 			{
 				resultData->full_roi_data[i].distance[j] = data[len++] << 8;
 				resultData->full_roi_data[i].distance[j] += data[len++];
