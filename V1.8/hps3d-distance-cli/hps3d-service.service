@@ -1,9 +1,11 @@
 [Unit]
 Description=HPS3D-160 LIDAR Service
-After=network.target
+After=network.target mosquitto.service
 
 [Service]
 Type=simple
+WorkingDirectory=/usr/local/bin
+Environment=LD_LIBRARY_PATH=/usr/local/lib
 ExecStart=/usr/local/bin/hps3d_service -d
 Restart=always
 RestartSec=5

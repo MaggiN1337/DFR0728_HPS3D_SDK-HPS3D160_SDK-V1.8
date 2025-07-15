@@ -1,16 +1,14 @@
-# HPS3D-160 LIDAR Service Konfiguration
-
-# Debug-Einstellungen
+# Debug settings
 debug=1
-debug_file=hps3d_debug.log
+debug_file=/var/log/hps3d_service.log
 
-# Minimale Anzahl gültiger Pixel im 5x5 Messbereich (max 25)
-# Standard: 6 (25% der Pixel)
+# Threading settings
+use_threading=1  # Set to 0 to disable multi-threading for MQTT/HTTP handlers
+
+# Measurement settings
 min_valid_pixels=6
 
-# Messpunkte im Format: x,y,name
-# x: 0-159, y: 0-59
-# Beachte: 5x5 Messbereich muss innerhalb des Sensors liegen
+# Point definitions (x,y,name)
 40,30,point_1
 120,30,point_2
 40,45,point_3

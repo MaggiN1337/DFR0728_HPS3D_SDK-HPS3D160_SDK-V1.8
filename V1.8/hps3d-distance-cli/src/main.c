@@ -162,11 +162,14 @@ void signal_handler(int sig) {
     running = 0;
 }
 
-// Konfigurationsdatei laden
+// Global variables
+static int use_threading = 1;  // Default to using threads
+
+// Load configuration
 int load_config() {
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
-        printf("Verwende Standard-Konfiguration\n");
+        printf("Using default configuration\n");
         return 0;
     }
     
@@ -175,8 +178,15 @@ int load_config() {
     char debug_file_path[256] = DEFAULT_DEBUG_FILE;
     
     while (fgets(line, sizeof(line), fp)) {
-        // Kommentare und leere Zeilen überspringen
+        // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '\n') continue;
+        
+        // Threading configuration
+        if (strncmp(line, "use_threading=", 13) == 0) {
+            use_threading = atoi(line + 13);
+            debug_print("Threading configuration: %s\n", use_threading ? "enabled" : "disabled");
+            continue;
+        }
         
         // Debug-Einstellungen verarbeiten
         if (strncmp(line, "debug=", 6) == 0) {
@@ -286,23 +296,54 @@ int init_lidar() {
 }
 
 // Einzelne Messung durchführen
-int measure_points() {
-    if (!HPS3D_IsConnect(g_handle)) {
-        return -1;
+static int measure_points(void) {
+    if (!measurement_active) {
+        usleep(100000); // Sleep 100ms when inactive
+        return 0;
     }
 
-    HPS3D_EventType_t event_type;
-    HPS3D_StatusTypeDef ret = HPS3D_SingleCapture(g_handle, &event_type, &g_measureData);
-    
+    HPS3D_StatusTypeDef ret;
+    HPS3D_EventType_t type;
+    static int retry_count = 0;
+    const int MAX_RETRIES = 3;
+
+    // Check if LIDAR needs reconnection
+    if (reconnect_needed || g_handle == -1) {
+        debug_print("Attempting to reconnect LIDAR...\n");
+        if (init_lidar() != 0) {
+            debug_print("Failed to reconnect LIDAR\n");
+            return -1;
+        }
+        reconnect_needed = false;
+    }
+
+    // Single capture with retry logic
+    ret = HPS3D_SingleCapture(g_handle, &type, &g_measureData);
     if (ret != HPS3D_RET_OK) {
-        printf("WARNUNG: Messung fehlgeschlagen (%d)\n", ret);
+        debug_print("Single capture failed, attempt %d of %d\n", retry_count + 1, MAX_RETRIES);
+        retry_count++;
+        
+        if (retry_count >= MAX_RETRIES) {
+            debug_print("Max retries reached, resetting connection\n");
+            if (g_handle != -1) {
+                HPS3D_CloseDevice(g_handle);
+                g_handle = -1;
+            }
+            retry_count = 0;
+            return -1;
+        }
+        
+        usleep(100000); // Wait 100ms before retry
         return -1;
     }
-
+    
+    retry_count = 0; // Reset retry counter on success
+    
+    // Process measurement data...
     pthread_mutex_lock(&data_mutex);
     
     // Alle 4 Punkte messen
-    if (event_type == HPS3D_FULL_DEPTH_EVEN) {
+    if (type == HPS3D_FULL_DEPTH_EVEN) {
         for (int i = 0; i < MAX_POINTS; i++) {
             int center_x = points[i].x;
             int center_y = points[i].y;
@@ -558,51 +599,30 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
                 message->topic, (int)message->payloadlen, (char*)message->payload);
     
     if (strcmp(message->topic, MQTT_CONTROL_TOPIC) == 0) {
-        if (strncmp(message->payload, "start", message->payloadlen) == 0) {
-            measurement_active = 1;
-            debug_print("Messung aktiviert via MQTT\n");
-        } else if (strncmp(message->payload, "stop", message->payloadlen) == 0) {
-            measurement_active = 0;
-            debug_print("Messung deaktiviert via MQTT\n");
-        } else if (strncmp(message->payload, "get_pointcloud", message->payloadlen) == 0) {
-            debug_print("Punktwolke angefordert via MQTT\n");
-            
-            // Prüfe ob LIDAR verbunden
-            if (!HPS3D_IsConnect(g_handle)) {
-                debug_print("FEHLER: LIDAR nicht verbunden\n");
-                return;
-            }
-            
-            // Prüfe ob Messdaten initialisiert
-            if (!g_measureData.full_depth_data.distance) {
-                debug_print("FEHLER: Messdaten nicht initialisiert\n");
-                return;
-            }
-            
-            // Führe Messung durch
-            if (measure_points() != 0) {
-                debug_print("FEHLER: Punktwolken-Messung fehlgeschlagen\n");
-                return;
-            }
-            
-            // Erstelle JSON
-            char* cloud_json = create_pointcloud_json();
-            if (!cloud_json) {
-                debug_print("FEHLER: JSON-Erstellung fehlgeschlagen\n");
-                return;
-            }
-            
-            // Sende Daten
-            if (mosq && mqtt_connected) {
-                int rc = mosquitto_publish(mosq, NULL, MQTT_POINTCLOUD_TOPIC, 
-                                strlen(cloud_json), cloud_json, 0, false);
-                if (rc != MOSQ_ERR_SUCCESS) {
-                    debug_print("FEHLER: MQTT Publish fehlgeschlagen (%d)\n", rc);
-                } else {
-                    debug_print("Punktwolke erfolgreich gesendet\n");
+        char *payload = (char *)message->payload;
+        if (strcmp(payload, "start") == 0) {
+            if (!measurement_active) {
+                debug_print("Starting measurement on MQTT request\n");
+                // Initialize LIDAR if not connected
+                if (g_handle == -1) {
+                    if (init_lidar() != 0) {
+                        debug_print("Failed to initialize LIDAR\n");
+                        mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen("error: LIDAR init failed"), 
+                                        "error: LIDAR init failed", 0, false);
+                        return;
+                    }
                 }
-            } else {
-                debug_print("FEHLER: MQTT nicht verbunden\n");
+                measurement_active = 1;
+            }
+        } else if (strcmp(payload, "stop") == 0) {
+            if (measurement_active) {
+                debug_print("Stopping measurement on MQTT request\n");
+                measurement_active = 0;
+                // Close LIDAR connection if open
+                if (g_handle != -1) {
+                    HPS3D_CloseDevice(g_handle);
+                    g_handle = -1;
+                }
             }
         }
     }
@@ -878,52 +898,57 @@ int main(int argc, char *argv[]) {
         debug_print("WARNUNG: PID-Datei konnte nicht erstellt werden\n");
     }
     
-    // MQTT initialisieren
+    // Initialize with LIDAR disconnected
+    measurement_active = 0;
+    g_handle = -1;
+    
+    // Load configuration
+    if (load_config() < 0) {
+        printf("Failed to load configuration\n");
+        return -1;
+    }
+    
+    // Initialize MQTT
     if (init_mqtt() != 0) {
-        debug_print("WARNUNG: MQTT konnte nicht initialisiert werden\n");
+        printf("Failed to initialize MQTT\n");
+        return -1;
     }
     
-    // HTTP Server starten - Fehler werden toleriert
-    init_http_server();
-    
-    // LIDAR initialisieren
-    if (init_lidar() != 0) {
-        debug_print("FEHLER: LIDAR konnte nicht initialisiert werden\n");
-        cleanup();
-        return 1;
-    }
-    
-    debug_print("Service gestartet, warte auf Aktivierung via MQTT/HTTP...\n");
-    
-    // Threads starten
-    pthread_t measure_tid, output_tid, http_tid;
-    
-    if (pthread_create(&measure_tid, NULL, measure_thread, NULL) != 0) {
-        debug_print("FEHLER: Mess-Thread konnte nicht erstellt werden\n");
-        cleanup();
-        return 1;
-    }
-    
-    if (pthread_create(&output_tid, NULL, output_thread, NULL) != 0) {
-        debug_print("FEHLER: Output-Thread konnte nicht erstellt werden\n");
-        cleanup();
-        return 1;
-    }
-    
-    // HTTP-Thread nur starten wenn Socket erfolgreich erstellt wurde
-    if (http_socket >= 0) {
-        if (pthread_create(&http_tid, NULL, http_server_thread, NULL) != 0) {
-            debug_print("FEHLER: HTTP-Thread konnte nicht erstellt werden\n");
-            cleanup();
-            return 1;
+    // Initialize HTTP server if threading is enabled
+    if (use_threading) {
+        if (init_http_server() != 0) {
+            printf("Failed to initialize HTTP server\n");
+            return -1;
         }
-        pthread_join(http_tid, NULL);
+    } else {
+        debug_print("HTTP server disabled (threading disabled)\n");
     }
     
-    // Auf Threads warten
-    pthread_join(measure_tid, NULL);
-    pthread_join(output_tid, NULL);
+    // Create measurement thread if threading is enabled
+    pthread_t measure_thread_id;
+    if (use_threading) {
+        if (pthread_create(&measure_thread_id, NULL, measure_thread, NULL) != 0) {
+            printf("Failed to create measurement thread\n");
+            return -1;
+        }
+    }
     
+    // Main loop
+    while (running) {
+        if (use_threading) {
+            // Just handle MQTT in main thread
+            mosquitto_loop(mosq, -1, 1);
+        } else {
+            // Single-threaded mode: do everything in sequence
+            mosquitto_loop(mosq, 0, 1);  // Non-blocking MQTT check
+            if (measurement_active) {
+                measure_points();
+            }
+            usleep(MEASURE_INTERVAL_MS * 1000);
+        }
+    }
+    
+    // Cleanup
     cleanup();
     return 0;
 }
