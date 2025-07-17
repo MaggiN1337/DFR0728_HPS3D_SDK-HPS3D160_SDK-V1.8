@@ -1,14 +1,28 @@
 [Unit]
 Description=HPS3D-160 LIDAR Service
 After=network.target mosquitto.service
+Requires=mosquitto.service
 
 [Service]
 Type=simple
 WorkingDirectory=/usr/local/bin
 Environment=LD_LIBRARY_PATH=/usr/local/lib
 ExecStart=/usr/local/bin/hps3d_service -d
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=300
+StartLimitBurst=3
+TimeoutStartSec=60
+TimeoutStopSec=60
+
+# Give the service time to start up and initialize hardware
+ExecStartPre=/bin/sleep 2
+
+# Create required directories
+ExecStartPre=/bin/mkdir -p /var/log/hps3d
+ExecStartPre=/bin/chown root:root /var/log/hps3d
+ExecStartPre=/bin/chmod 755 /var/log/hps3d
+
 User=root
 Group=root
 

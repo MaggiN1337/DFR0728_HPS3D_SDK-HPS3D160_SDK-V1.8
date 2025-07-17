@@ -85,25 +85,32 @@ static volatile int measurement_active = 0;
 static volatile int pointcloud_requested = 0;
 static volatile int mqtt_connected = 0;
 
-// Debug-Ausgabe Funktion
+// Improved debug logging
 void debug_print(const char* format, ...) {
     static FILE* debug_file = NULL;
     static int first_call = 1;
     
-    // Beim ersten Aufruf Debug-File öffnen
+    // Open debug file on first call
     if (first_call) {
-        debug_file = fopen("debug_hps3d.log", "w");
+        debug_file = fopen("/var/log/hps3d/debug_hps3d.log", "a");  // Changed to append mode
         if (!debug_file) {
-            fprintf(stderr, "FEHLER: Debug-Datei konnte nicht geöffnet werden\n");
+            fprintf(stderr, "ERROR: Could not open debug file: %s\n", strerror(errno));
             return;
         }
         first_call = 0;
+        
+        // Add startup separator in log
+        time_t now = time(NULL);
+        char timestamp[26];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(debug_file, "\n=== Service started at %s ===\n", timestamp);
+        fflush(debug_file);
     }
 
     va_list args;
     va_start(args, format);
     
-    // In Debug-Datei schreiben
+    // Add timestamp to log
     time_t now = time(NULL);
     char timestamp[26];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -143,25 +150,25 @@ static void EventCallBackFunc(int handle, int eventType, uint8_t *data, int data
     HPS3D_EventType_t event = (HPS3D_EventType_t)eventType;
     switch (event) {
         case HPS3D_DISCONNECT_EVEN:
-            printf("WARNUNG: HPS3D-160 getrennt, versuche Wiederverbindung...\n");
+            debug_print("WARNUNG: HPS3D-160 getrennt, versuche Wiederverbindung...\n");
             reconnect_needed = true;
             break;
         case HPS3D_SYS_EXCEPTION_EVEN:
             if (data) {
-                printf("WARNUNG: System Exception: %s\n", (char*)data);
+                debug_print("WARNUNG: System Exception: %s\n", (char*)data);
             } else {
-                printf("WARNUNG: System Exception (keine Details verfügbar)\n");
+                debug_print("WARNUNG: System Exception (keine Details verfügbar)\n");
             }
             break;
         default:
-            printf("WARNUNG: Unbekanntes Event: %d\n", eventType);
+            debug_print("WARNUNG: Unbekanntes Event: %d\n", eventType);
             break;
     }
 }
 
-// Signal Handler
+// Improved signal handler
 void signal_handler(int sig) {
-    printf("Signal %d empfangen, beende Service...\n", sig);
+    debug_print("Received signal %d, initiating graceful shutdown...\n", sig);
     running = 0;
 }
 
@@ -248,53 +255,42 @@ int load_config() {
     return point_idx;
 }
 
-// LIDAR initialisieren
-int init_lidar() {
-    HPS3D_StatusTypeDef ret;
+// Improved LIDAR initialization
+static int init_lidar(void) {
+    debug_print("Initializing LIDAR...\n");
 
-    debug_print("Initialisiere LIDAR...\n");
+    if (g_handle >= 0) {
+        debug_print("LIDAR already initialized, closing first...\n");
+        HPS3D_CloseDevice(g_handle);
+        g_handle = -1;
+        usleep(500000); // Wait 500ms before reconnecting
+    }
 
-    // Messdatenstruktur initialisieren
-    ret = HPS3D_MeasureDataInit(&g_measureData);
+    // Initialize measurement data structure
+    HPS3D_StatusTypeDef ret = HPS3D_MeasureDataInit(&g_measureData);
     if (ret != HPS3D_RET_OK) {
-        debug_print("FEHLER: Messdatenstruktur konnte nicht initialisiert werden\n");
+        debug_print("ERROR: Failed to initialize measurement data structure: %d\n", ret);
         return -1;
     }
 
-    debug_print("Messdatenstruktur initialisiert\n");
-
-    // Callback registrieren
-    ret = HPS3D_RegisterEventCallback(EventCallBackFunc, NULL);
-    if (ret != HPS3D_RET_OK) {
-        debug_print("FEHLER: Callback-Registrierung fehlgeschlagen\n");
-        return -1;
-    }
-
-    // USB Verbindung aufbauen
+    // Try to connect to LIDAR
+    debug_print("Attempting to connect to LIDAR on %s...\n", USB_PORT);
     ret = HPS3D_USBConnectDevice(USB_PORT, &g_handle);
     if (ret != HPS3D_RET_OK) {
-        debug_print("FEHLER: Verbindung zu HPS3D-160 fehlgeschlagen (%d)\n", ret);
+        debug_print("ERROR: Failed to connect to LIDAR: %d\n", ret);
         return -1;
     }
 
-    debug_print("LIDAR verbunden: %s\n", HPS3D_GetDeviceVersion(g_handle));
-
-    // Weniger aggressive Filtereinstellungen
-    HPS3D_SetDistanceFilterConf(g_handle, false, 0.1f);
-    HPS3D_SetSmoothFilterConf(g_handle, HPS3D_SMOOTH_FILTER_DISABLE, 0);
-    HPS3D_SetEdgeFilterEnable(g_handle, false);
-    
-    // Optische Wegkorrektur aktivieren für genauere Messungen
-    HPS3D_SetOpticalPathCalibration(g_handle, true);
-
-    // Messung starten
-    ret = HPS3D_StartCapture(g_handle);
+    // Register event callback
+    ret = HPS3D_RegisterEventCallback(EventCallBackFunc, NULL);
     if (ret != HPS3D_RET_OK) {
-        debug_print("FEHLER: Messung konnte nicht gestartet werden\n");
+        debug_print("ERROR: Failed to register event callback: %d\n", ret);
+        HPS3D_CloseDevice(g_handle);
+        g_handle = -1;
         return -1;
     }
 
-    debug_print("LIDAR initialisiert und gestartet\n");
+    debug_print("LIDAR initialized successfully\n");
     return 0;
 }
 
@@ -867,19 +863,28 @@ int create_pid_file() {
     return 0;
 }
 
-// Cleanup aktualisiert
+// Improved cleanup
 void cleanup(void) {
-    debug_print("Cleanup...\n");
+    debug_print("Starting cleanup...\n");
     
-    running = 0;  // Threads stoppen
+    running = 0;  // Ensure all threads stop
     
+    // Stop LIDAR
     if (g_handle >= 0) {
+        debug_print("Stopping LIDAR capture...\n");
         HPS3D_StopCapture(g_handle);
+        debug_print("Closing LIDAR device...\n");
         HPS3D_CloseDevice(g_handle);
+        g_handle = -1;
     }
     
+    // Cleanup MQTT
     if (mosq) {
+        debug_print("Cleaning up MQTT...\n");
         if (mqtt_connected) {
+            mosquitto_publish(mosq, NULL, MQTT_TOPIC, 
+                            strlen("{\"status\":\"service_stopped\"}"),
+                            "{\"status\":\"service_stopped\"}", 0, false);
             mosquitto_disconnect(mosq);
         }
         mosquitto_loop_stop(mosq, true);
@@ -887,30 +892,35 @@ void cleanup(void) {
         mosquitto_lib_cleanup();
     }
     
+    // Close HTTP socket
     if (http_socket >= 0) {
+        debug_print("Closing HTTP socket...\n");
         close(http_socket);
     }
     
+    // Free measurement data
+    debug_print("Freeing measurement data...\n");
     HPS3D_MeasureDataFree(&g_measureData);
     HPS3D_UnregisterEventCallback();
     
+    // Close debug file
     if (debug_file) {
+        debug_print("=== Service stopped ===\n\n");
         fclose(debug_file);
     }
     
+    // Remove PID file
     unlink(PID_FILE);
     
-    debug_print("Service beendet\n");
+    debug_print("Cleanup complete\n");
 }
 
-// Hauptprogramm
+// Main function
 int main(int argc, char *argv[]) {
-    // Debug sofort aktivieren
-    debug_print("HPS3D-160 LIDAR Service startet...\n");
-    
-    // Signal Handler
+    // Set up signal handlers first
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGHUP, signal_handler);
     
     // Parse arguments
     int daemon_mode = 0;
@@ -923,14 +933,21 @@ int main(int argc, char *argv[]) {
             test_mode = 1;
         }
     }
+
+    // Create log directory if it doesn't exist
+    mkdir("/var/log/hps3d", 0755);
+    
+    // Initialize debug logging
+    debug_print("Service starting...\n");
     
     // Test mode: just validate config and exit
     if (test_mode) {
+        debug_print("Running in test mode\n");
         if (load_config() < 0) {
-            printf("Configuration test failed\n");
+            debug_print("Configuration test failed\n");
             return 1;
         }
-        printf("Configuration test passed\n");
+        debug_print("Configuration test passed\n");
         return 0;
     }
     
