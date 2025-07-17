@@ -330,9 +330,9 @@ static int measure_points(void) {
                 g_handle = -1;
             }
             retry_count = 0;
-            return -1;
-        }
-        
+        return -1;
+    }
+
         usleep(100000); // Wait 100ms before retry
         return -1;
     }
@@ -609,8 +609,8 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
                         debug_print("Failed to initialize LIDAR\n");
                         mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen("error: LIDAR init failed"), 
                                         "error: LIDAR init failed", 0, false);
-                        return;
-                    }
+                return;
+            }
                 }
                 measurement_active = 1;
             }
@@ -919,7 +919,7 @@ int main(int argc, char *argv[]) {
         if (init_http_server() != 0) {
             printf("Failed to initialize HTTP server\n");
             return -1;
-        }
+    }
     } else {
         debug_print("HTTP server disabled (threading disabled)\n");
     }
@@ -930,7 +930,7 @@ int main(int argc, char *argv[]) {
         if (pthread_create(&measure_thread_id, NULL, measure_thread, NULL) != 0) {
             printf("Failed to create measurement thread\n");
             return -1;
-        }
+    }
     }
     
     // Main loop
@@ -943,7 +943,7 @@ int main(int argc, char *argv[]) {
             mosquitto_loop(mosq, 0, 1);  // Non-blocking MQTT check
             if (measurement_active) {
                 measure_points();
-            }
+    }
             usleep(MEASURE_INTERVAL_MS * 1000);
         }
     }

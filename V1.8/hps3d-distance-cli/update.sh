@@ -72,25 +72,40 @@ if ! /usr/local/bin/hps3d_service -t; then
     echo "The service may not work correctly until configuration is fixed."
 fi
 
-# Restart service if it was running
+# Stop old service if running
 if systemctl is-active --quiet hps3d-service; then
-    echo "Restarting service..."
-    systemctl restart hps3d-service
-else
-    echo "Service is not running"
-    echo "To start the service, run: sudo systemctl start hps3d-service"
+    echo "Stopping old service..."
+    systemctl stop hps3d-service
 fi
+
+# Reload systemd and enable service
+echo "Configuring service..."
+systemctl daemon-reload
+systemctl enable hps3d-service
 
 echo "Installation complete!"
 echo ""
-echo "Usage:"
-echo "1. Edit configuration if needed: sudo nano /etc/hps3d/points.conf"
-echo "2. Start service: sudo systemctl start hps3d-service"
-echo "3. Enable service at boot: sudo systemctl enable hps3d-service"
+echo "Service is installed but not started."
+echo ""
+echo "To control the service:"
+echo "1. Start: sudo systemctl start hps3d-service"
+echo "2. Stop: sudo systemctl stop hps3d-service"
+echo "3. Status: sudo systemctl status hps3d-service"
 echo "4. View logs: sudo journalctl -u hps3d-service -f"
 echo ""
 echo "MQTT Control:"
 echo "Start measurement: mosquitto_pub -t \"hps3d/control\" -m \"start\""
 echo "Stop measurement: mosquitto_pub -t \"hps3d/control\" -m \"stop\""
 echo ""
-echo "Debug log: /var/log/hps3d/debug_hps3d.log" 
+echo "Debug log: /var/log/hps3d/debug_hps3d.log"
+
+# Ask user if they want to start the service now
+read -p "Do you want to start the service now? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Starting service..."
+    systemctl start hps3d-service
+    echo "Service started. Check status with: sudo systemctl status hps3d-service"
+else
+    echo "Service not started. You can start it later with: sudo systemctl start hps3d-service"
+fi 
