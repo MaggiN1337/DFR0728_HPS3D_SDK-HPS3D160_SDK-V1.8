@@ -62,9 +62,9 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
 #define HTTP_PORT 8080
 #define HTTP_RESPONSE "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nContent-Type: application/json\r\n\r\n%s"
 
-// MQTT Konfiguration
+// MQTT Configuration
 #define MQTT_HOST "localhost"
-#define MQTT_PORT 1883
+#define MQTT_DEFAULT_PORT 1883
 #define MQTT_TOPIC "hps3d/measurements"
 #define MQTT_CONTROL_TOPIC "hps3d/control"
 #define MQTT_POINTCLOUD_TOPIC "hps3d/pointcloud"  // Neues Topic für Punktwolke
@@ -222,6 +222,13 @@ int load_config() {
             continue;
         }
         
+        // MQTT port configuration
+        if (strncmp(line, "mqtt_port=", 10) == 0) {
+            mqtt_port = atoi(line + 10);
+            debug_print("MQTT port set to: %d\n", mqtt_port);
+            continue;
+        }
+        
         // Messpunkte verarbeiten
         int x, y;
         char name[32];
@@ -255,32 +262,160 @@ int load_config() {
     return point_idx;
 }
 
+// Improved memory management
+static void init_measurement_data(void) {
+    debug_print("Initializing measurement data structures...\n");
+    
+    // Initialize measurement data structure
+    memset(&g_measureData, 0, sizeof(HPS3D_MeasureData_t));
+    
+    // Allocate memory for ROI data
+    g_measureData.simple_roi_data = (HPS3D_SimpleRoiData_t*)calloc(MAX_POINTS, sizeof(HPS3D_SimpleRoiData_t));
+    g_measureData.full_roi_data = (HPS3D_FullRoiData_t*)calloc(MAX_POINTS, sizeof(HPS3D_FullRoiData_t));
+    
+    if (!g_measureData.simple_roi_data || !g_measureData.full_roi_data) {
+        debug_print("ERROR: Failed to allocate ROI data memory\n");
+        cleanup();
+        exit(1);
+    }
+    
+    // Allocate memory for depth data
+    const int MAX_PIXELS = 160 * 60;  // Maximum sensor resolution
+    g_measureData.simple_depth_data.distance = (uint16_t*)calloc(MAX_PIXELS, sizeof(uint16_t));
+    g_measureData.full_depth_data.distance = (uint16_t*)calloc(MAX_PIXELS, sizeof(uint16_t));
+    
+    if (!g_measureData.simple_depth_data.distance || !g_measureData.full_depth_data.distance) {
+        debug_print("ERROR: Failed to allocate depth data memory\n");
+        cleanup();
+        exit(1);
+    }
+    
+    // Allocate memory for point cloud data
+    g_measureData.full_depth_data.point_cloud_data.point_data = 
+        (HPS3D_PerPointCloudData_t*)calloc(MAX_PIXELS, sizeof(HPS3D_PerPointCloudData_t));
+    
+    if (!g_measureData.full_depth_data.point_cloud_data.point_data) {
+        debug_print("ERROR: Failed to allocate point cloud memory\n");
+        cleanup();
+        exit(1);
+    }
+    
+    // Initialize measurement points
+    for (int i = 0; i < MAX_POINTS; i++) {
+        g_measureData.full_roi_data[i].distance = (uint16_t*)calloc(MAX_PIXELS, sizeof(uint16_t));
+        if (!g_measureData.full_roi_data[i].distance) {
+            debug_print("ERROR: Failed to allocate ROI distance memory\n");
+            cleanup();
+            exit(1);
+        }
+    }
+    
+    debug_print("Memory initialization complete\n");
+}
+
+// Improved cleanup with proper memory deallocation
+void cleanup(void) {
+    debug_print("Starting cleanup...\n");
+    
+    running = 0;  // Ensure all threads stop
+    
+    // Stop LIDAR first
+    if (g_handle >= 0) {
+        debug_print("Stopping LIDAR capture...\n");
+        HPS3D_StopCapture(g_handle);
+        debug_print("Closing LIDAR device...\n");
+        HPS3D_CloseDevice(g_handle);
+        g_handle = -1;
+    }
+    
+    // Free measurement data memory
+    debug_print("Freeing measurement data memory...\n");
+    
+    if (g_measureData.simple_roi_data) {
+        free(g_measureData.simple_roi_data);
+        g_measureData.simple_roi_data = NULL;
+    }
+    
+    if (g_measureData.full_roi_data) {
+        for (int i = 0; i < MAX_POINTS; i++) {
+            if (g_measureData.full_roi_data[i].distance) {
+                free(g_measureData.full_roi_data[i].distance);
+            }
+        }
+        free(g_measureData.full_roi_data);
+        g_measureData.full_roi_data = NULL;
+    }
+    
+    if (g_measureData.simple_depth_data.distance) {
+        free(g_measureData.simple_depth_data.distance);
+        g_measureData.simple_depth_data.distance = NULL;
+    }
+    
+    if (g_measureData.full_depth_data.distance) {
+        free(g_measureData.full_depth_data.distance);
+        g_measureData.full_depth_data.distance = NULL;
+    }
+    
+    if (g_measureData.full_depth_data.point_cloud_data.point_data) {
+        free(g_measureData.full_depth_data.point_cloud_data.point_data);
+        g_measureData.full_depth_data.point_cloud_data.point_data = NULL;
+    }
+    
+    // Cleanup MQTT
+    if (mosq) {
+        debug_print("Cleaning up MQTT...\n");
+        if (mqtt_connected) {
+            mosquitto_publish(mosq, NULL, MQTT_TOPIC, 
+                            strlen("{\"status\":\"service_stopped\"}"),
+                            "{\"status\":\"service_stopped\"}", 0, false);
+            mosquitto_disconnect(mosq);
+        }
+        mosquitto_loop_stop(mosq, true);
+        mosquitto_destroy(mosq);
+        mosquitto_lib_cleanup();
+    }
+    
+    // Close HTTP socket
+    if (http_socket >= 0) {
+        debug_print("Closing HTTP socket...\n");
+        close(http_socket);
+    }
+    
+    // Close debug file
+    if (debug_file) {
+        debug_print("=== Service stopped ===\n\n");
+        fclose(debug_file);
+        debug_file = NULL;
+    }
+    
+    // Remove PID file
+    unlink(PID_FILE);
+    
+    debug_print("Cleanup complete\n");
+}
+
 // Improved LIDAR initialization
 static int init_lidar(void) {
     debug_print("Initializing LIDAR...\n");
-
+    
     if (g_handle >= 0) {
         debug_print("LIDAR already initialized, closing first...\n");
         HPS3D_CloseDevice(g_handle);
         g_handle = -1;
         usleep(500000); // Wait 500ms before reconnecting
     }
-
-    // Initialize measurement data structure
-    HPS3D_StatusTypeDef ret = HPS3D_MeasureDataInit(&g_measureData);
-    if (ret != HPS3D_RET_OK) {
-        debug_print("ERROR: Failed to initialize measurement data structure: %d\n", ret);
-        return -1;
-    }
-
+    
+    // Initialize measurement data
+    init_measurement_data();
+    
     // Try to connect to LIDAR
     debug_print("Attempting to connect to LIDAR on %s...\n", USB_PORT);
-    ret = HPS3D_USBConnectDevice(USB_PORT, &g_handle);
+    HPS3D_StatusTypeDef ret = HPS3D_USBConnectDevice(USB_PORT, &g_handle);
     if (ret != HPS3D_RET_OK) {
         debug_print("ERROR: Failed to connect to LIDAR: %d\n", ret);
         return -1;
     }
-
+    
     // Register event callback
     ret = HPS3D_RegisterEventCallback(EventCallBackFunc, NULL);
     if (ret != HPS3D_RET_OK) {
@@ -289,7 +424,7 @@ static int init_lidar(void) {
         g_handle = -1;
         return -1;
     }
-
+    
     debug_print("LIDAR initialized successfully\n");
     return 0;
 }
@@ -684,37 +819,45 @@ void mqtt_disconnect_callback(struct mosquitto *mosq, void *userdata, int rc) {
 
 // MQTT Initialisierung aktualisiert
 int init_mqtt(void) {
+    debug_print("Initializing MQTT (port %d)...\n", mqtt_port);
+    
     mosquitto_lib_init();
+    
     mosq = mosquitto_new(NULL, true, NULL);
     if (!mosq) {
-        printf("FEHLER: MQTT Client konnte nicht erstellt werden\n");
+        debug_print("Failed to create MQTT instance\n");
         return -1;
     }
-
-    // Callbacks setzen
+    
     mosquitto_connect_callback_set(mosq, mqtt_connect_callback);
     mosquitto_disconnect_callback_set(mosq, mqtt_disconnect_callback);
     mosquitto_message_callback_set(mosq, mqtt_message_callback);
-
-    // Verbindungsversuch
-    if (mosquitto_connect(mosq, MQTT_HOST, MQTT_PORT, 60) != MOSQ_ERR_SUCCESS) {
-        printf("WARNUNG: MQTT Verbindung fehlgeschlagen - verwende nur HTTP\n");
-        return -1;
+    
+    int rc = mosquitto_connect(mosq, MQTT_HOST, mqtt_port, 60);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        debug_print("MQTT connect failed: %s\n", mosquitto_strerror(rc));
+        
+        // Try alternative port if default fails
+        if (mqtt_port == MQTT_DEFAULT_PORT) {
+            mqtt_port = MQTT_DEFAULT_PORT + 1;  // Try 1884
+            debug_print("Retrying with alternative port %d...\n", mqtt_port);
+            rc = mosquitto_connect(mosq, MQTT_HOST, mqtt_port, 60);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                debug_print("MQTT connect failed on alternative port: %s\n", mosquitto_strerror(rc));
+                return -1;
+            }
+        } else {
+            return -1;
+        }
     }
-
-    // Subscribe to control topic
-    if (mosquitto_subscribe(mosq, NULL, MQTT_CONTROL_TOPIC, 0) != MOSQ_ERR_SUCCESS) {
-        printf("WARNUNG: MQTT Subscribe fehlgeschlagen\n");
-        return -1;
-    }
-
-    // Start MQTT loop in background
+    
+    // Start MQTT thread
     if (mosquitto_loop_start(mosq) != MOSQ_ERR_SUCCESS) {
-        printf("WARNUNG: MQTT Loop konnte nicht gestartet werden\n");
+        debug_print("Failed to start MQTT loop\n");
         return -1;
     }
-
-    printf("MQTT Client verbunden mit %s:%d\n", MQTT_HOST, MQTT_PORT);
+    
+    debug_print("MQTT initialized successfully on port %d\n", mqtt_port);
     return 0;
 }
 
@@ -863,64 +1006,13 @@ int create_pid_file() {
     return 0;
 }
 
-// Improved cleanup
-void cleanup(void) {
-    debug_print("Starting cleanup...\n");
-    
-    running = 0;  // Ensure all threads stop
-    
-    // Stop LIDAR
-    if (g_handle >= 0) {
-        debug_print("Stopping LIDAR capture...\n");
-        HPS3D_StopCapture(g_handle);
-        debug_print("Closing LIDAR device...\n");
-        HPS3D_CloseDevice(g_handle);
-        g_handle = -1;
-    }
-    
-    // Cleanup MQTT
-    if (mosq) {
-        debug_print("Cleaning up MQTT...\n");
-        if (mqtt_connected) {
-            mosquitto_publish(mosq, NULL, MQTT_TOPIC, 
-                            strlen("{\"status\":\"service_stopped\"}"),
-                            "{\"status\":\"service_stopped\"}", 0, false);
-            mosquitto_disconnect(mosq);
-        }
-        mosquitto_loop_stop(mosq, true);
-        mosquitto_destroy(mosq);
-        mosquitto_lib_cleanup();
-    }
-    
-    // Close HTTP socket
-    if (http_socket >= 0) {
-        debug_print("Closing HTTP socket...\n");
-        close(http_socket);
-    }
-    
-    // Free measurement data
-    debug_print("Freeing measurement data...\n");
-    HPS3D_MeasureDataFree(&g_measureData);
-    HPS3D_UnregisterEventCallback();
-    
-    // Close debug file
-    if (debug_file) {
-        debug_print("=== Service stopped ===\n\n");
-        fclose(debug_file);
-    }
-    
-    // Remove PID file
-    unlink(PID_FILE);
-    
-    debug_print("Cleanup complete\n");
-}
-
 // Main function
 int main(int argc, char *argv[]) {
     // Set up signal handlers first
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
+    signal(SIGSEGV, signal_handler);  // Catch segmentation faults
     
     // Parse arguments
     int daemon_mode = 0;
@@ -937,8 +1029,14 @@ int main(int argc, char *argv[]) {
     // Create log directory if it doesn't exist
     mkdir("/var/log/hps3d", 0755);
     
-    // Initialize debug logging
-    debug_print("Service starting...\n");
+    // Initialize debug logging first
+    if (!debug_file) {
+        debug_file = fopen("/var/log/hps3d/debug_hps3d.log", "a");
+        if (!debug_file) {
+            fprintf(stderr, "ERROR: Could not open debug file\n");
+            return 1;
+        }
+    }
     
     // Test mode: just validate config and exit
     if (test_mode) {
