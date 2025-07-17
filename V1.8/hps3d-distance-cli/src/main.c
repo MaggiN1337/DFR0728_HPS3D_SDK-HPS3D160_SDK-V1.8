@@ -84,6 +84,7 @@ static int http_socket = -1;
 static volatile int measurement_active = 0;
 static volatile int pointcloud_requested = 0;
 static volatile int mqtt_connected = 0;
+static int mqtt_port = MQTT_DEFAULT_PORT;  // Initialize with default port
 
 // Improved debug logging
 void debug_print(const char* format, ...) {
