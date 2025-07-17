@@ -24,6 +24,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <mosquitto.h>
+#include <fcntl.h> // For daemon mode
+#include <sys/types.h> // For daemon mode
+#include <unistd.h> // For daemon mode
 
 // HPS3D SDK Headers
 #include "HPS3DUser_IF.h"
@@ -312,6 +315,11 @@ static int measure_points(void) {
         debug_print("Attempting to reconnect LIDAR...\n");
         if (init_lidar() != 0) {
             debug_print("Failed to reconnect LIDAR\n");
+            if (mosq && mqtt_connected) {
+                mosquitto_publish(mosq, NULL, MQTT_TOPIC, 
+                                strlen("{\"error\":\"lidar_connection_failed\"}"),
+                                "{\"error\":\"lidar_connection_failed\"}", 0, false);
+            }
             return -1;
         }
         reconnect_needed = false;
@@ -330,16 +338,21 @@ static int measure_points(void) {
                 g_handle = -1;
             }
             retry_count = 0;
-        return -1;
-    }
-
+            if (mosq && mqtt_connected) {
+                mosquitto_publish(mosq, NULL, MQTT_TOPIC, 
+                                strlen("{\"error\":\"measurement_failed\"}"),
+                                "{\"error\":\"measurement_failed\"}", 0, false);
+            }
+            return -1;
+        }
+        
         usleep(100000); // Wait 100ms before retry
         return -1;
     }
     
     retry_count = 0; // Reset retry counter on success
     
-    // Process measurement data...
+    // Process measurement data and publish via MQTT
     pthread_mutex_lock(&data_mutex);
     
     // Alle 4 Punkte messen
@@ -420,6 +433,25 @@ static int measure_points(void) {
                           valid_count, AREA_SIZE * AREA_SIZE, min_valid_pixels);
             }
         }
+    }
+    
+    // Publish measurement results
+    char json[1024];
+    snprintf(json, sizeof(json), 
+            "{\"timestamp\":%ld,\"points\":[" \
+            "{\"name\":\"%s\",\"distance\":%.2f,\"min\":%.2f,\"max\":%.2f,\"valid\":%d}," \
+            "{\"name\":\"%s\",\"distance\":%.2f,\"min\":%.2f,\"max\":%.2f,\"valid\":%d}," \
+            "{\"name\":\"%s\",\"distance\":%.2f,\"min\":%.2f,\"max\":%.2f,\"valid\":%d}," \
+            "{\"name\":\"%s\",\"distance\":%.2f,\"min\":%.2f,\"max\":%.2f,\"valid\":%d}" \
+            "]}",
+            time(NULL),
+            points[0].name, points[0].distance, points[0].min_distance, points[0].max_distance, points[0].valid,
+            points[1].name, points[1].distance, points[1].min_distance, points[1].max_distance, points[1].valid,
+            points[2].name, points[2].distance, points[2].min_distance, points[2].max_distance, points[2].valid,
+            points[3].name, points[3].distance, points[3].min_distance, points[3].max_distance, points[3].valid);
+    
+    if (mosq && mqtt_connected) {
+        mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen(json), json, 0, false);
     }
     
     pthread_mutex_unlock(&data_mutex);
@@ -603,26 +635,18 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
         if (strcmp(payload, "start") == 0) {
             if (!measurement_active) {
                 debug_print("Starting measurement on MQTT request\n");
-                // Initialize LIDAR if not connected
-                if (g_handle == -1) {
-                    if (init_lidar() != 0) {
-                        debug_print("Failed to initialize LIDAR\n");
-                        mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen("error: LIDAR init failed"), 
-                                        "error: LIDAR init failed", 0, false);
-                return;
-            }
-                }
                 measurement_active = 1;
+                // Send confirmation
+                mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen("{\"status\":\"started\"}"), 
+                                "{\"status\":\"started\"}", 0, false);
             }
         } else if (strcmp(payload, "stop") == 0) {
             if (measurement_active) {
                 debug_print("Stopping measurement on MQTT request\n");
                 measurement_active = 0;
-                // Close LIDAR connection if open
-                if (g_handle != -1) {
-                    HPS3D_CloseDevice(g_handle);
-                    g_handle = -1;
-                }
+                // Send confirmation
+                mosquitto_publish(mosq, NULL, MQTT_TOPIC, strlen("{\"status\":\"stopped\"}"), 
+                                "{\"status\":\"stopped\"}", 0, false);
             }
         }
     }
@@ -888,9 +912,70 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    // Daemon Mode
-    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
-        daemon(0, 0);
+    // Parse arguments
+    int daemon_mode = 0;
+    int test_mode = 0;
+    
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0) {
+            daemon_mode = 1;
+        } else if (strcmp(argv[i], "-t") == 0) {
+            test_mode = 1;
+        }
+    }
+    
+    // Test mode: just validate config and exit
+    if (test_mode) {
+        if (load_config() < 0) {
+            printf("Configuration test failed\n");
+            return 1;
+        }
+        printf("Configuration test passed\n");
+        return 0;
+    }
+    
+    // Daemon mode setup
+    if (daemon_mode) {
+        // Close all open file descriptors
+        for (int i = getdtablesize(); i >= 0; --i) {
+            close(i);
+        }
+        
+        // Fork and exit parent
+        pid_t pid = fork();
+        if (pid < 0) {
+            exit(1);
+        }
+        if (pid > 0) {
+            exit(0);
+        }
+        
+        // Create new session
+        setsid();
+        
+        // Fork again
+        pid = fork();
+        if (pid < 0) {
+            exit(1);
+        }
+        if (pid > 0) {
+            exit(0);
+        }
+        
+        // Change working directory
+        chdir("/");
+        
+        // Reset umask
+        umask(0);
+        
+        // Redirect standard files to /dev/null
+        int fd = open("/dev/null", O_RDWR);
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > 2) {
+            close(fd);
+        }
     }
     
     // PID-Datei erstellen
