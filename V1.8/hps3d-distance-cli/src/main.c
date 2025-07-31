@@ -24,13 +24,24 @@
 #include <stdarg.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <mosquitto.h>
+#include <stdbool.h>
 #include <stdatomic.h> // Required for _Atomic
 #include <sys/types.h>
-#include <signal.h>
+
+// MQTT and HPS3D includes with mock fallback
+#if defined(MOCK_LIDAR) || defined(MOCK_MQTT)
+    #include "HPS3D_mock.h"  // This includes both LIDAR and MQTT mocks
+#else
+    #include <mosquitto.h>
+    // Will include real HPS3D headers below
+#endif
 
 // HPS3D SDK Headers
-#include "HPS3DUser_IF.h"
+#ifdef MOCK_LIDAR
+    // Already included in HPS3D_mock.h above
+#else
+    #include "HPS3DUser_IF.h"
+#endif
 
 // Forward declarations
 static int init_lidar(void);
@@ -289,7 +300,7 @@ void cleanup_lidar_resources(void) {
     }
     
     // Messdatenstruktur bereinigen
-    HPS3D_MeasureDataDestroy(&g_measureData);
+    HPS3D_MeasureDataFree(&g_measureData);
     debug_print("Messdatenstruktur bereinigt\n");
     
     atomic_store(&device_connected, 0);
@@ -1142,8 +1153,8 @@ static int thread_join_timeout(pthread_t thread, void **retval, const struct tim
         // Kurze Pause
         usleep(10000);  // 10ms
     }
-}
 #endif
+}
 
 // Hauptprogramm anpassen
 int main(int argc, char *argv[]) {
