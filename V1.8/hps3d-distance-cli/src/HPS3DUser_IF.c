@@ -1,10 +1,13 @@
 #include "HPS3DUser_IF.h"
 
 #ifdef _WIN32 /*windows*/
-
+#include <stdio.h>
+#include <string.h>
 #else
 #include <stddef.h>
-#include<stdlib.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #endif
 
 /**
@@ -502,6 +505,14 @@ HPS3D_StatusTypeDef HPS3D_MeasureDataInit(__IN HPS3D_MeasureData_t *data)
 {
 	HPS3D_StatusTypeDef ret = HPS3D_RET_OK;
 
+	// Critical NULL pointer check
+	if (!data) {
+		fprintf(stderr, "ERROR: HPS3D_MeasureDataInit called with NULL data pointer\n");
+		return HPS3D_RET_ERROR;
+	}
+
+	// Initialize all pointers to NULL first for safety
+	memset(data, 0, sizeof(HPS3D_MeasureData_t));
 	data->full_depth_data.point_cloud_data.point_data = NULL;
 	uint32_t i = 0;
 	do
@@ -520,9 +531,12 @@ HPS3D_StatusTypeDef HPS3D_MeasureDataInit(__IN HPS3D_MeasureData_t *data)
 			data->full_roi_data[i].distance = (uint16_t *)malloc(sizeof(uint16_t) * HPS3D_MAX_PIXEL_NUMBER);
 			if (data->full_roi_data[i].distance == NULL)
 			{
+				fprintf(stderr, "ERROR: Failed to allocate ROI distance buffer %d\n", i);
 				ret = HPS3D_RET_BUFF_EMPTY;
 				break;
 			}
+			// Initialize allocated memory to safe values
+			memset(data->full_roi_data[i].distance, 0, sizeof(uint16_t) * HPS3D_MAX_PIXEL_NUMBER);
 		}
 
 		data->simple_roi_data = NULL;
@@ -538,18 +552,24 @@ HPS3D_StatusTypeDef HPS3D_MeasureDataInit(__IN HPS3D_MeasureData_t *data)
 		data->full_depth_data.distance = (uint16_t *)malloc(sizeof(uint16_t)* HPS3D_MAX_PIXEL_NUMBER);
 		if (data->full_depth_data.distance == NULL)
 		{
+			fprintf(stderr, "ERROR: Failed to allocate full depth distance buffer\n");
 			ret = HPS3D_RET_BUFF_EMPTY;
 			break;
 		}
+		// Initialize critical distance buffer to safe values
+		memset(data->full_depth_data.distance, 0, sizeof(uint16_t) * HPS3D_MAX_PIXEL_NUMBER);
 
 
 		/*点云数据分配*/
 		data->full_depth_data.point_cloud_data.point_data = (HPS3D_PerPointCloudData_t *)malloc(sizeof(HPS3D_PerPointCloudData_t)*HPS3D_MAX_PIXEL_NUMBER);
 		if (data->full_depth_data.point_cloud_data.point_data == NULL)
 		{
+			fprintf(stderr, "ERROR: Failed to allocate point cloud data buffer\n");
 			ret = HPS3D_RET_BUFF_EMPTY;
 			break;
 		}
+		// Initialize critical point cloud buffer to safe values
+		memset(data->full_depth_data.point_cloud_data.point_data, 0, sizeof(HPS3D_PerPointCloudData_t) * HPS3D_MAX_PIXEL_NUMBER);
 
 	} while (0);
 
@@ -567,33 +587,49 @@ HPS3D_StatusTypeDef HPS3D_MeasureDataFree(__IN HPS3D_MeasureData_t *data)
 {
 	HPS3D_StatusTypeDef ret = HPS3D_RET_OK;
 	uint32_t i = 0;
+	
+	// Critical NULL pointer check
+	if (!data) {
+		fprintf(stderr, "WARNING: HPS3D_MeasureDataFree called with NULL data pointer\n");
+		return HPS3D_RET_ERROR;
+	}
+	
 	do
 	{
-		for (i = 0; i < HPS3D_MAX_ROI_NUMBER; i++)
-		{
-			if (data->full_roi_data[i].distance != NULL)
+		// Safe cleanup with NULL pointer protection
+		if (data->full_roi_data) {
+			for (i = 0; i < HPS3D_MAX_ROI_NUMBER; i++)
 			{
-				free(data->full_roi_data[i].distance);
+				if (data->full_roi_data[i].distance != NULL)
+				{
+					free(data->full_roi_data[i].distance);
+					data->full_roi_data[i].distance = NULL;  // Prevent double-free
+				}
 			}
-		}
-		if (data->full_roi_data != NULL)
-		{
 			free(data->full_roi_data);
+			data->full_roi_data = NULL;
 		}
+		
 		if (data->simple_roi_data != NULL)
 		{
 			free(data->simple_roi_data);
+			data->simple_roi_data = NULL;
 		}
 
 		if (data->full_depth_data.distance != NULL)
 		{
 			free(data->full_depth_data.distance);
+			data->full_depth_data.distance = NULL;
 		}
 
 		if (data->full_depth_data.point_cloud_data.point_data != NULL)
 		{
 			free(data->full_depth_data.point_cloud_data.point_data);
+			data->full_depth_data.point_cloud_data.point_data = NULL;
 		}
+		
+		// Final safety: zero out the entire structure
+		memset(data, 0, sizeof(HPS3D_MeasureData_t));
 	} while (0);
 	return ret;
 }

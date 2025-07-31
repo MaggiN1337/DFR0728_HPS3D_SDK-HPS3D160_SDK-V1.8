@@ -39,6 +39,11 @@ static int init_http_server(void);
 static int measure_points(void);
 static char* create_json_output(void);
 static void cleanup(void);
+static void cleanup_lidar_resources(void);
+static int check_connection_health(void);
+static int reconnect_lidar_with_backoff(void);
+static void enter_power_save_mode(void);
+static void exit_power_save_mode(void);
 static int create_pid_file(void);
 static int load_config(void);
 
@@ -97,6 +102,9 @@ static int http_socket = -1;
 static volatile _Atomic int measurement_active = 0;
 static volatile _Atomic int pointcloud_requested = 0;
 static volatile _Atomic int mqtt_connected = 0;
+static volatile _Atomic int device_connected = 0;
+static volatile _Atomic int connection_retries = 0;
+static volatile _Atomic int power_save_mode = 0;
 int debug_enabled = DEFAULT_DEBUG_ENABLED;
 static int min_valid_pixels = DEFAULT_MIN_VALID_PIXELS;
 static FILE* debug_file = NULL;  // Globale debug_file Variable
@@ -133,11 +141,15 @@ static MeasurePoint points[MAX_POINTS] = {
     }
 };
 
-// Debug-Ausgabe Funktion
+// Debug-Ausgabe Funktion mit verbesserter Sicherheit
 void debug_print(const char* format, ...) {
-    if (!debug_enabled) return;
+    if (!debug_enabled || !format) return;  // NULL-Pointer-Schutz für format
     
-    pthread_mutex_lock(&debug_mutex);
+    if (pthread_mutex_lock(&debug_mutex) != 0) {
+        // Fallback wenn Mutex nicht verfügbar - direkt auf stderr
+        fprintf(stderr, "ERROR: Debug mutex lock failed\n");
+        return;
+    }
     
     // Beim ersten Aufruf Debug-File öffnen
     if (!debug_file) {
@@ -255,7 +267,102 @@ int init_lidar() {
     }
 
     debug_print("LIDAR initialisiert und gestartet\n");
+    atomic_store(&device_connected, 1);
+    atomic_store(&connection_retries, 0);
     return 0;
+}
+
+// LIDAR-Ressourcen vollständig bereinigen
+void cleanup_lidar_resources(void) {
+    debug_print("Bereinige LIDAR-Ressourcen...\n");
+    
+    if (g_handle >= 0) {
+        // Messung stoppen
+        HPS3D_StopCapture(g_handle);
+        debug_print("LIDAR Capture gestoppt\n");
+        
+        // Gerät schließen und USB-Verbindung trennen
+        HPS3D_CloseDevice(g_handle);
+        debug_print("LIDAR-Gerät geschlossen\n");
+        
+        g_handle = -1;
+    }
+    
+    // Messdatenstruktur bereinigen
+    HPS3D_MeasureDataDestroy(&g_measureData);
+    debug_print("Messdatenstruktur bereinigt\n");
+    
+    atomic_store(&device_connected, 0);
+    debug_print("LIDAR-Ressourcen vollständig bereinigt\n");
+}
+
+// Verbindungsgesundheit prüfen
+int check_connection_health(void) {
+    if (g_handle < 0) {
+        return 0; // Nicht verbunden
+    }
+    
+    // Prüfe ob Gerät noch verbunden ist
+    if (!HPS3D_IsConnect(g_handle)) {
+        debug_print("WARNUNG: LIDAR-Verbindung verloren\n");
+        atomic_store(&device_connected, 0);
+        return 0;
+    }
+    
+    return 1; // Verbindung OK
+}
+
+// Wiederverbindung mit exponential backoff
+int reconnect_lidar_with_backoff(void) {
+    int retries = atomic_load(&connection_retries);
+    int backoff_ms = (1 << retries) * 500; // 500ms, 1s, 2s, 4s, 8s, max 16s
+    
+    if (backoff_ms > 16000) {
+        backoff_ms = 16000; // Max 16 Sekunden
+    }
+    
+    debug_print("Wiederverbindung in %dms (Versuch %d)...\n", backoff_ms, retries + 1);
+    usleep(backoff_ms * 1000);
+    
+    // Alte Ressourcen vollständig bereinigen
+    cleanup_lidar_resources();
+    
+    // Neuverbindung versuchen  
+    if (init_lidar() == 0) {
+        debug_print("Wiederverbindung erfolgreich nach %d Versuchen\n", retries + 1);
+        atomic_store(&connection_retries, 0);
+        return 0;
+    } else {
+        atomic_fetch_add(&connection_retries, 1);
+        debug_print("Wiederverbindung fehlgeschlagen (Versuch %d)\n", retries + 1);
+        return -1;
+    }
+}
+
+// Power-Save-Modus aktivieren
+void enter_power_save_mode(void) {
+    if (atomic_load(&power_save_mode)) {
+        return; // Bereits im Power-Save-Modus
+    }
+    
+    debug_print("Aktiviere Power-Save-Modus...\n");
+    
+    // LIDAR-Ressourcen vollständig freigeben
+    cleanup_lidar_resources();
+    
+    atomic_store(&power_save_mode, 1);
+    debug_print("Power-Save-Modus aktiv - alle Ressourcen freigegeben\n");
+}
+
+// Power-Save-Modus deaktivieren
+void exit_power_save_mode(void) {
+    if (!atomic_load(&power_save_mode)) {
+        return; // Nicht im Power-Save-Modus
+    }
+    
+    debug_print("Deaktiviere Power-Save-Modus...\n");
+    atomic_store(&power_save_mode, 0);
+    debug_print("Power-Save-Modus deaktiviert\n");
 }
 
 // Einzelne Messung durchführen
@@ -395,9 +502,15 @@ char* create_json_output() {
         "{"
         "\"timestamp\": %ld,"
         "\"active\": %s,"
+        "\"device_connected\": %s,"
+        "\"power_save_mode\": %s,"
+        "\"connection_retries\": %d,"
         "\"measurements\": {",
         time(NULL),
-        atomic_load(&measurement_active) ? "true" : "false"
+        atomic_load(&measurement_active) ? "true" : "false",
+        atomic_load(&device_connected) ? "true" : "false",
+        atomic_load(&power_save_mode) ? "true" : "false",
+        atomic_load(&connection_retries)
     );
     
     for (int i = 0; i < MAX_POINTS; i++) {
@@ -601,9 +714,11 @@ void mqtt_connect_callback(struct mosquitto *mosq, void *userdata, int result) {
         }
         
         // Status nach Verbindung senden
-        char status[100];
-        snprintf(status, sizeof(status), "{\"status\": \"connected\", \"active\": %s}", 
-                atomic_load(&measurement_active) ? "true" : "false");
+        char status[200];
+        snprintf(status, sizeof(status), "{\"status\": \"connected\", \"active\": %s, \"device_connected\": %s, \"power_save\": %s}", 
+                atomic_load(&measurement_active) ? "true" : "false",
+                atomic_load(&device_connected) ? "true" : "false",
+                atomic_load(&power_save_mode) ? "true" : "false");
         mosquitto_publish(mosq, NULL, MQTT_TOPIC "/status", strlen(status), status, 0, false);
     } else {
         atomic_store(&mqtt_connected, 0);
@@ -725,9 +840,12 @@ void* http_server_thread(void* arg) {
             if (strstr(buffer, "GET /status") != NULL) {
                 // Status Abfrage
                 snprintf(response, sizeof(response), 
-                        "{\"active\": %s, \"connected\": %s}", 
+                        "{\"active\": %s, \"connected\": %s, \"device_connected\": %s, \"power_save\": %s, \"retries\": %d}", 
                         atomic_load(&measurement_active) ? "true" : "false",
-                        HPS3D_IsConnect(g_handle) ? "true" : "false");
+                        (g_handle >= 0 && HPS3D_IsConnect(g_handle)) ? "true" : "false",
+                        atomic_load(&device_connected) ? "true" : "false",
+                        atomic_load(&power_save_mode) ? "true" : "false",
+                        atomic_load(&connection_retries));
             }
             else if (strstr(buffer, "POST /start") != NULL) {
                 // Messung starten
@@ -759,47 +877,95 @@ void* http_server_thread(void* arg) {
     return NULL;
 }
 
-// Mess-Thread
+// Mess-Thread mit verbesserter Idle-Mode-Verwaltung
 void* measure_thread(void* arg) {
     (void)arg;  // Ungenutzte Parameter markieren
     bool was_active = false;  // Merker für Zustandswechsel
+    int idle_cycles = 0;      // Zähler für Idle-Zyklen
+    int health_check_counter = 0; // Zähler für Verbindungsprüfungen
+    
+    debug_print("Mess-Thread gestartet mit verbesserter Power-Management-Logik\n");
     
     while (running) {
-        if (!atomic_load(&measurement_active)) {
+        bool is_active = atomic_load(&measurement_active);
+        
+        if (!is_active) {
+            // === IDLE MODE LOGIC ===
             if (was_active) {
-                debug_print("Messung inaktiv - stoppe und schließe Sensor\n");
-                if (g_handle >= 0) {
-                    HPS3D_StopCapture(g_handle);
-                    HPS3D_CloseDevice(g_handle);
-                    g_handle = -1;
-                }
+                debug_print("Messung inaktiv - aktiviere Power-Save-Modus\n");
+                enter_power_save_mode();
                 was_active = false;
+                idle_cycles = 0;
             }
-            usleep(100000);  // 100ms Pause wenn inaktiv
+            
+            idle_cycles++;
+            
+            // Nach längerer Inaktivität weniger häufig prüfen
+            if (idle_cycles < 50) {
+                usleep(100000);  // 100ms für die ersten 5 Sekunden
+            } else if (idle_cycles < 300) {
+                usleep(500000);  // 500ms für die nächsten 125 Sekunden
+            } else {
+                usleep(1000000); // 1s nach 5+ Minuten Inaktivität
+            }
             continue;
         }
 
+        // === ACTIVE MODE LOGIC ===
+        
         // Sensor bei Aktivierung neu initialisieren
         if (!was_active) {
-            debug_print("Messung aktiviert - initialisiere Sensor\n");
+            debug_print("Messung aktiviert - verlasse Power-Save-Modus\n");
+            exit_power_save_mode();
+            
+            debug_print("Initialisiere LIDAR für aktive Messung...\n");
             if (init_lidar() == 0) {
                 was_active = true;
-                debug_print("Sensor erfolgreich initialisiert\n");
+                idle_cycles = 0;
+                health_check_counter = 0;
+                debug_print("LIDAR erfolgreich für aktive Messung initialisiert\n");
             } else {
-                debug_print("FEHLER: Sensor konnte nicht initialisiert werden\n");
-                usleep(1000000);  // 1s Pause vor erneutem Versuch
+                debug_print("FEHLER: LIDAR-Initialisierung fehlgeschlagen\n");
+                if (reconnect_lidar_with_backoff() != 0) {
+                    // Exponential backoff failed, wait longer before retry
+                    usleep(5000000);  // 5s Pause bei wiederholten Fehlern
+                }
                 continue;
             }
         }
 
-        // reconnect_needed is removed, so this block is removed
+        // Verbindungsgesundheit regelmäßig prüfen (alle 50 Messzyklen)
+        health_check_counter++;
+        if (health_check_counter >= 50) {
+            if (!check_connection_health()) {
+                debug_print("Verbindungsgesundheitscheck fehlgeschlagen - Wiederverbindung\n");
+                if (reconnect_lidar_with_backoff() != 0) {
+                    // Reconnection failed, continue will retry
+                    continue;
+                }
+            }
+            health_check_counter = 0;
+        }
 
+        // Messpunkt erfassen
         if (measure_points() != 0) {
-            usleep(500000); // 500ms Pause bei Fehler
+            debug_print("Messfehler - prüfe Verbindung\n");
+            if (!check_connection_health()) {
+                debug_print("Verbindung verloren während Messung - Wiederverbindung\n");
+                if (reconnect_lidar_with_backoff() != 0) {
+                    continue; // Retry connection on next iteration
+                }
+            } else {
+                usleep(500000); // 500ms Pause bei normalem Messfehler
+            }
         } else {
+            // Erfolgreiche Messung - normales Intervall
             usleep(MEASURE_INTERVAL_MS * 1000);
         }
     }
+    
+    debug_print("Mess-Thread beendet - bereinige Ressourcen\n");
+    cleanup_lidar_resources();
     return NULL;
 }
 
@@ -902,13 +1068,9 @@ void cleanup(void) {
     atomic_store(&measurement_active, 0);
     atomic_store(&pointcloud_requested, 0);
     
-    // LIDAR stoppen und schließen
-    if (g_handle >= 0) {
-        debug_print("Stoppe LIDAR...\n");
-        HPS3D_StopCapture(g_handle);
-        HPS3D_CloseDevice(g_handle);
-        g_handle = -1;
-    }
+    // LIDAR-Ressourcen vollständig bereinigen
+    debug_print("Bereinige LIDAR-Ressourcen...\n");
+    cleanup_lidar_resources();
     
     // MQTT beenden
     if (mosq) {

@@ -1,0 +1,170 @@
+[Unit]
+Description=HPS3D-160 LIDAR Service (Raspberry Pi 4 Optimized)
+Documentation=file:///usr/local/share/doc/hps3d/pi4-optimizations.md
+After=network.target network-online.target multi-user.target systemd-udevd.service
+Wants=network-online.target
+Requires=systemd-udevd.service
+
+# Wait for USB subsystem to be ready
+After=sys-devices-platform-soc-3f980000.usb-usb1.device
+
+# Conflict with generic service to prevent conflicts
+Conflicts=hps3d.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hps3d_service -d
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart configuration optimized for Pi4
+Restart=always
+RestartSec=5
+StartLimitInterval=300
+StartLimitBurst=5
+RestartPreventExitStatus=1
+
+# User and security
+User=root
+Group=root
+SupplementaryGroups=dialout tty gpio
+
+# Pi4 Performance Optimizations
+CPUAffinity=0-3
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+CPUQuota=300%
+CPUWeight=1000
+
+# Memory management for Pi4 (4GB+ RAM)
+MemoryMax=2G
+MemoryHigh=1G
+MemorySwapMax=0
+
+# I/O optimizations
+IOSchedulingClass=1
+IOSchedulingPriority=4
+IOWeight=1000
+
+# Process limits
+TasksMax=100
+LimitNOFILE=2048
+LimitNPROC=512
+LimitCORE=0
+
+# Real-time slice assignment
+Slice=realtime.slice
+
+# Pi4 specific environment variables
+Environment="LIDAR_PLATFORM=raspberry-pi-4"
+Environment="ARM_ARCH=cortex-a72"
+Environment="USB_VERSION=3.0"
+Environment="GPIO_AVAILABLE=1"
+Environment="THERMAL_MANAGEMENT=1"
+
+# Configuration file locations
+Environment="HPS3D_CONFIG_FILE=/etc/hps3d/points.conf"
+Environment="PI4_TUNING_FILE=/etc/hps3d/pi4-tuning.conf"
+Environment="DEBUG_LOG_FILE=/var/log/hps3d/debug.log"
+
+# Hardware detection
+ConditionPathExists=/sys/firmware/devicetree/base/model
+ConditionFileNotEmpty=/sys/firmware/devicetree/base/model
+
+# Pi4 CPU detection
+ConditionPathExists=/proc/device-tree/cpus/cpu@0/compatible
+
+# USB 3.0 availability check
+ConditionPathExists=/sys/bus/usb/devices/usb1
+
+# GPIO availability
+ConditionPathExists=/sys/class/gpio
+
+# Service dependencies for Pi4 features
+Requisite=systemd-udevd.service
+
+# Working directory
+WorkingDirectory=/usr/local/bin
+
+# Security settings
+NoNewPrivileges=false
+PrivateTmp=true
+PrivateDevices=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/hps3d /var/lib/hps3d /run/hps3d /tmp
+
+# Capabilities needed for GPIO and USB access
+AmbientCapabilities=CAP_SYS_RAWIO CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_DAC_OVERRIDE CAP_NET_BIND_SERVICE
+
+# systemd watchdog (Pi4 has hardware watchdog support)
+WatchdogSec=30
+NotifyAccess=all
+
+# Pi4 thermal management hooks
+ExecStartPre=/bin/bash -c 'echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
+ExecStartPre=/bin/bash -c 'echo 800000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq'
+ExecStartPre=/bin/bash -c 'echo 1500000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq'
+
+# USB 3.0 optimization pre-start
+ExecStartPre=/bin/bash -c 'echo auto > /sys/bus/usb/devices/usb1/power/control || true'
+ExecStartPre=/bin/bash -c 'echo 2000 > /sys/bus/usb/devices/usb1/power/autosuspend_delay_ms || true'
+
+# GPIO setup for status indicators
+ExecStartPre=/bin/bash -c 'echo 18 > /sys/class/gpio/export || true'
+ExecStartPre=/bin/bash -c 'echo 19 > /sys/class/gpio/export || true'
+ExecStartPre=/bin/bash -c 'echo 20 > /sys/class/gpio/export || true'
+ExecStartPre=/bin/bash -c 'echo 21 > /sys/class/gpio/export || true'
+ExecStartPre=/bin/bash -c 'echo out > /sys/class/gpio/gpio18/direction || true'
+ExecStartPre=/bin/bash -c 'echo out > /sys/class/gpio/gpio19/direction || true'
+ExecStartPre=/bin/bash -c 'echo out > /sys/class/gpio/gpio20/direction || true'
+ExecStartPre=/bin/bash -c 'echo out > /sys/class/gpio/gpio21/direction || true'
+
+# Create necessary directories with proper permissions
+ExecStartPre=/bin/mkdir -p /var/log/hps3d
+ExecStartPre=/bin/mkdir -p /var/lib/hps3d
+ExecStartPre=/bin/mkdir -p /run/hps3d
+ExecStartPre=/bin/chown root:root /var/log/hps3d /var/lib/hps3d /run/hps3d
+
+# Set I/O scheduler for SD card optimization
+ExecStartPre=/bin/bash -c 'echo deadline > /sys/block/mmcblk0/queue/scheduler || true'
+ExecStartPre=/bin/bash -c 'echo 1024 > /sys/block/mmcblk0/queue/read_ahead_kb || true'
+
+# Network optimization for Gigabit Ethernet
+ExecStartPre=/bin/bash -c 'ethtool -s eth0 speed 1000 duplex full autoneg on || true'
+ExecStartPre=/bin/bash -c 'ethtool -K eth0 rx-checksumming on tx-checksumming on || true'
+
+# Post-start health check
+ExecStartPost=/bin/sleep 5
+ExecStartPost=/bin/bash -c 'pgrep -f hps3d_service > /run/hps3d/service.pid'
+ExecStartPost=/bin/bash -c 'echo 1 > /sys/class/gpio/gpio18/value || true'
+
+# Graceful shutdown with GPIO cleanup
+ExecStopPost=/bin/bash -c 'echo 0 > /sys/class/gpio/gpio18/value || true'
+ExecStopPost=/bin/bash -c 'echo 0 > /sys/class/gpio/gpio19/value || true'
+ExecStopPost=/bin/bash -c 'echo 0 > /sys/class/gpio/gpio20/value || true'
+ExecStopPost=/bin/bash -c 'echo 0 > /sys/class/gpio/gpio21/value || true'
+ExecStopPost=/bin/bash -c 'echo 18 > /sys/class/gpio/unexport || true'
+ExecStopPost=/bin/bash -c 'echo 19 > /sys/class/gpio/unexport || true'
+ExecStopPost=/bin/bash -c 'echo 20 > /sys/class/gpio/unexport || true'
+ExecStopPost=/bin/bash -c 'echo 21 > /sys/class/gpio/unexport || true'
+ExecStopPost=/bin/rm -f /run/hps3d/service.pid
+
+# Failure recovery with LED indication
+ExecReload=/bin/bash -c 'echo 1 > /sys/class/gpio/gpio21/value || true'
+ExecReload=/bin/sleep 1
+ExecReload=/bin/bash -c 'echo 0 > /sys/class/gpio/gpio21/value || true'
+
+# Standard output and error handling
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hps3d-pi4
+
+# Journal configuration
+LogLevelMax=info
+LogExtraFields=SERVICE_TYPE=lidar PLATFORM=raspberry-pi-4
+
+[Install]
+WantedBy=multi-user.target
+Alias=hps3d-lidar.service

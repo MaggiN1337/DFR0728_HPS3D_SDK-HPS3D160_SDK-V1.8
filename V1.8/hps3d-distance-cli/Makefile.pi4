@@ -1,0 +1,287 @@
+# Raspberry Pi 4 Optimized Makefile for HPS3D LIDAR Service
+# This Makefile includes Pi4-specific optimizations for ARM Cortex-A72
+
+# Pi4 Detection and Architecture Setup
+ARCH ?= $(shell uname -m)
+PI4_MODEL := $(shell cat /proc/device-tree/model 2>/dev/null | grep -i "raspberry pi 4" || echo "")
+ARM_ARCH := $(shell cat /proc/cpuinfo | grep "CPU architecture" | head -1 | awk '{print $$3}')
+
+# Determine if we're building on Pi4
+ifeq ($(ARCH),aarch64)
+    ifeq ($(PI4_MODEL),)
+        $(warning Building for aarch64 but Pi4 not detected - using generic optimizations)
+        PI4_DETECTED = 0
+    else
+        $(info Raspberry Pi 4 detected - enabling Pi4 optimizations)
+        PI4_DETECTED = 1
+    endif
+    CC = gcc
+else ifeq ($(ARCH),armv7l)
+    # Check if this is actually Pi4 running in 32-bit mode
+    ifeq ($(PI4_MODEL),)
+        PI4_DETECTED = 0
+    else
+        $(info Raspberry Pi 4 detected (32-bit mode) - enabling Pi4 optimizations)
+        PI4_DETECTED = 1
+    endif
+    CC = gcc
+else
+    # Cross-compilation for Pi4
+    $(info Cross-compiling for Raspberry Pi 4)
+    CC = aarch64-linux-gnu-gcc
+    CROSS_COMPILE = 1
+    PI4_DETECTED = 1
+endif
+
+# Base compiler flags
+CFLAGS = -I./lib -Wall -Wextra -std=gnu99
+
+# Pi4-specific optimizations
+ifeq ($(PI4_DETECTED),1)
+    # ARM Cortex-A72 specific optimizations
+    CFLAGS += -mcpu=cortex-a72 -mtune=cortex-a72
+    ifeq ($(ARCH),aarch64)
+        CFLAGS += -march=armv8-a+crc+simd
+    else
+        CFLAGS += -march=armv7-a+simd
+    endif
+    
+    # Performance optimizations for Pi4
+    CFLAGS += -O3 -ftree-vectorize -ffast-math -funroll-loops
+    CFLAGS += -fomit-frame-pointer -fno-stack-protector
+    CFLAGS += -mfpu=neon-fp-armv8 -mfloat-abi=hard
+    
+    # Pi4 specific defines
+    CFLAGS += -DTARGET_PI4=1 -DARM_NEON=1 -DUSB3_AVAILABLE=1
+    CFLAGS += -DCORTEX_A72=1 -DQUAD_CORE=1
+    
+    # Memory and cache optimizations
+    CFLAGS += -falign-functions=64 -falign-loops=64
+    CFLAGS += -fprofile-arcs -ftest-coverage -fdata-sections -ffunction-sections
+    
+    $(info Using Pi4 Cortex-A72 optimizations)
+else
+    # Generic ARM optimizations
+    CFLAGS += -O2 -DTARGET_GENERIC_ARM=1
+    $(info Using generic ARM optimizations)
+endif
+
+# Debug vs Release build
+DEBUG ?= 1
+ifeq ($(DEBUG),1)
+    CFLAGS += -g -DDEBUG=1 -DDEBUG_LEVEL=2
+    BUILD_TYPE = debug
+else
+    CFLAGS += -DNDEBUG=1 -flto
+    ifeq ($(PI4_DETECTED),1)
+        CFLAGS += -fwhole-program
+    endif
+    BUILD_TYPE = release
+endif
+
+# Linker flags
+LDFLAGS = -L./lib -lHPS3D -lpthread -lm -lmosquitto
+
+# Pi4 specific linker optimizations
+ifeq ($(PI4_DETECTED),1)
+    LDFLAGS += -Wl,--gc-sections -Wl,--strip-all
+    ifeq ($(DEBUG),0)
+        LDFLAGS += -flto
+    endif
+endif
+
+# Source files
+SRCS = src/main.c src/HPS3DUser_IF.c
+OBJS = $(SRCS:.c=.o)
+
+# Target executable
+TARGET = hps3d_service
+
+# Configuration files
+CONFIG_FILES = points.conf.example config/pi4-tuning.conf
+SERVICE_FILE = hps3d-pi4.service
+DOCS = docs/pi4-optimizations.md
+
+# Build targets
+.PHONY: all clean install install-pi4 check-pi4 test-performance deploy-pi4 benchmark
+
+all: check-pi4 $(TARGET)
+
+# Main target with dependency tracking
+$(TARGET): $(OBJS)
+	@echo "Linking $(TARGET) for $(ARCH) ($(BUILD_TYPE) build)"
+	$(CC) -o $@ $^ $(LDFLAGS)
+	@echo "Build complete: $(TARGET)"
+	@if [ $(PI4_DETECTED) -eq 1 ]; then \
+		echo "Pi4 optimizations: ENABLED"; \
+		echo "CPU target: cortex-a72"; \
+		echo "USB 3.0 support: ENABLED"; \
+	else \
+		echo "Pi4 optimizations: DISABLED"; \
+	fi
+
+# Object file compilation with automatic dependency generation
+%.o: %.c
+	@echo "Compiling $< for $(ARCH)"
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+	
+# Include dependency files
+-include $(SRCS:.c=.d)
+
+# Pi4 detection and validation
+check-pi4:
+	@echo "=== Raspberry Pi 4 Build Check ==="
+	@echo "Architecture: $(ARCH)"
+	@echo "Pi4 Model: $(if $(PI4_MODEL),$(PI4_MODEL),Not detected)"
+	@echo "ARM Architecture: $(ARM_ARCH)"
+	@echo "Compiler: $(CC)"
+	@echo "Pi4 Optimizations: $(if $(PI4_DETECTED),ENABLED,DISABLED)"
+	@if [ -f /proc/device-tree/model ]; then \
+		echo "Device Tree Model: $$(cat /proc/device-tree/model)"; \
+	fi
+	@if [ -f /sys/firmware/devicetree/base/model ]; then \
+		echo "Firmware Model: $$(cat /sys/firmware/devicetree/base/model)"; \
+	fi
+	@echo "USB 3.0 Controller: $$(lsusb | grep -i "3.0 root hub" | wc -l) devices"
+	@echo "=================================="
+
+# Performance testing and benchmarking
+test-performance: $(TARGET)
+	@echo "=== Performance Testing ==="
+	@echo "Testing measurement latency..."
+	@timeout 10 ./$(TARGET) --test-mode --benchmark || echo "Test completed"
+	@echo "Checking CPU affinity support..."
+	@taskset -c 0 echo "CPU affinity: OK" || echo "CPU affinity: Not available"
+	@echo "USB 3.0 performance test..."
+	@if [ -c /dev/ttyACM0 ]; then \
+		echo "HPS3D device found on /dev/ttyACM0"; \
+	else \
+		echo "HPS3D device not connected"; \
+	fi
+
+# Benchmark against Pi3 performance (if baseline exists)
+benchmark: $(TARGET)
+	@echo "=== Performance Benchmark ==="
+	@if [ -f benchmark/pi3_baseline.txt ]; then \
+		echo "Comparing against Pi3 baseline..."; \
+		./benchmark/run_benchmark.sh $(TARGET); \
+	else \
+		echo "Creating new benchmark baseline..."; \
+		mkdir -p benchmark; \
+		./benchmark/create_baseline.sh $(TARGET); \
+	fi
+
+# Pi4-specific installation
+install-pi4: check-pi4 $(TARGET)
+	@echo "Installing HPS3D service with Pi4 optimizations..."
+	
+	# Create directories
+	sudo mkdir -p /usr/local/bin
+	sudo mkdir -p /etc/hps3d
+	sudo mkdir -p /var/log/hps3d
+	sudo mkdir -p /var/lib/hps3d
+	sudo mkdir -p /usr/local/share/doc/hps3d
+	
+	# Install binary
+	sudo install -m 755 $(TARGET) /usr/local/bin/
+	
+	# Install library
+	sudo install -m 644 lib/libHPS3D.so /usr/local/lib/
+	sudo ldconfig
+	
+	# Install configuration files
+	sudo install -m 644 config/pi4-tuning.conf /etc/hps3d/
+	test -f /etc/hps3d/points.conf || sudo install -m 644 points.conf.example /etc/hps3d/points.conf
+	
+	# Install Pi4-optimized systemd service
+	sudo install -m 644 $(SERVICE_FILE) /etc/systemd/system/
+	sudo systemctl daemon-reload
+	
+	# Install documentation
+	sudo install -m 644 docs/pi4-optimizations.md /usr/local/share/doc/hps3d/
+	
+	# Set up GPIO permissions
+	sudo usermod -a -G gpio $$USER || true
+	
+	# Create udev rule for HPS3D device with Pi4 optimizations
+	echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666", GROUP="dialout", SYMLINK+="hps3d", TAG+="systemd"' | sudo tee /etc/udev/rules.d/99-hps3d-pi4.rules
+	sudo udevadm control --reload-rules
+	
+	# Pi4 system optimizations
+	@echo "Applying Pi4 system optimizations..."
+	sudo bash -c 'echo "net.core.rmem_max = 134217728" >> /etc/sysctl.d/99-hps3d-pi4.conf'
+	sudo bash -c 'echo "net.core.wmem_max = 134217728" >> /etc/sysctl.d/99-hps3d-pi4.conf'
+	sudo bash -c 'echo "vm.swappiness = 1" >> /etc/sysctl.d/99-hps3d-pi4.conf'
+	sudo sysctl -p /etc/sysctl.d/99-hps3d-pi4.conf || true
+	
+	@echo "=========================================="
+	@echo "Pi4 Installation Complete!"
+	@echo "=========================================="
+	@echo "To start the service:"
+	@echo "  sudo systemctl enable --now hps3d-pi4"
+	@echo ""
+	@echo "To check status:"
+	@echo "  sudo systemctl status hps3d-pi4"
+	@echo ""
+	@echo "To view logs:"
+	@echo "  sudo journalctl -u hps3d-pi4 -f"
+	@echo ""
+	@echo "To test MQTT:"
+	@echo "  mosquitto_pub -h localhost -t hps3d/control -m start"
+	@echo "  mosquitto_sub -h localhost -t hps3d/measurements"
+	@echo ""
+	@echo "Configuration files:"
+	@echo "  /etc/hps3d/points.conf - Measurement points"
+	@echo "  /etc/hps3d/pi4-tuning.conf - Pi4 optimizations"
+	@echo ""
+	@echo "Documentation:"
+	@echo "  /usr/local/share/doc/hps3d/pi4-optimizations.md"
+	@echo "=========================================="
+
+# Standard installation (compatibility)
+install: install-pi4
+
+# Pi4 deployment script
+deploy-pi4: $(TARGET)
+	@echo "Creating Pi4 deployment package..."
+	mkdir -p deploy/pi4
+	cp $(TARGET) lib/libHPS3D.so $(CONFIG_FILES) $(SERVICE_FILE) deploy/pi4/
+	cp $(DOCS) deploy/pi4/
+	tar czf hps3d-pi4-$(shell date +%Y%m%d).tar.gz -C deploy pi4
+	@echo "Deployment package created: hps3d-pi4-$(shell date +%Y%m%d).tar.gz"
+
+# Clean build artifacts
+clean:
+	rm -f $(OBJS) $(TARGET) $(SRCS:.c=.d)
+	rm -rf deploy/
+	rm -f *.tar.gz
+	@echo "Clean complete"
+
+# Help target
+help:
+	@echo "Raspberry Pi 4 Optimized HPS3D LIDAR Service Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all                 - Build the service with Pi4 optimizations"
+	@echo "  check-pi4           - Check Pi4 detection and capabilities"
+	@echo "  test-performance    - Run performance tests"
+	@echo "  benchmark          - Run benchmarks against baseline"
+	@echo "  install-pi4        - Install with Pi4 optimizations"
+	@echo "  deploy-pi4         - Create deployment package"
+	@echo "  clean              - Clean build artifacts"
+	@echo ""
+	@echo "Variables:"
+	@echo "  DEBUG=0            - Release build (default: 1 for debug)"
+	@echo "  ARCH=<arch>        - Target architecture (auto-detected)"
+	@echo ""
+	@echo "Pi4 Features:"
+	@echo "  - ARM Cortex-A72 optimizations (-mcpu=cortex-a72)"
+	@echo "  - USB 3.0 support and optimizations"
+	@echo "  - Quad-core thread affinity"
+	@echo "  - NEON SIMD instructions"
+	@echo "  - Pi4-specific systemd service"
+	@echo "  - GPIO status indicators"
+	@echo "  - Thermal management integration"
+
+# Set default target
+.DEFAULT_GOAL := all
